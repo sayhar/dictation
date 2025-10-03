@@ -19,34 +19,37 @@ A lightweight, local push-to-talk dictation app for macOS using OpenAI's Whisper
 - Python 3.12+
 - [uv](https://github.com/astral-sh/uv) package manager
 
-### Setup
+### Quick Install
 
-1. Clone the repository:
+1. **Install uv** (if not already installed):
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+2. **Clone and build**:
 ```bash
 git clone https://github.com/yourusername/dictation-app.git
 cd dictation-app
-```
-
-2. Install dependencies:
-```bash
 uv sync
+uv run python setup.py py2app
 ```
 
-3. Build the app:
-```bash
-python setup.py py2app
-```
-
-4. Copy to Applications:
+3. **Install the app**:
 ```bash
 cp -R dist/Dictation.app ~/Applications/
+open ~/Applications/Dictation.app
 ```
 
-5. Grant permissions when prompted:
-   - Accessibility (for keyboard monitoring)
-   - Microphone (for audio recording)
+4. **Grant permissions** when prompted:
+   - **Accessibility** (required for keyboard monitoring)
+   - **Microphone** (required for audio recording)
 
-6. Launch from Applications folder
+If the app doesn't request permissions automatically:
+- Go to System Settings → Privacy & Security → Accessibility
+- Click the "+" button and add Dictation.app
+- Do the same for Microphone
+
+5. **First run**: The app will download the selected Whisper model (~500MB for "small") on first use. This happens in the background.
 
 ## Usage
 
