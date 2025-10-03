@@ -23,7 +23,7 @@ A lightweight, local push-to-talk dictation app for macOS using OpenAI's Whisper
 
 1. **Install uv** (if not already installed):
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+brew install uv
 ```
 
 2. **Clone and build**:
