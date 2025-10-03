@@ -28,7 +28,7 @@ brew install uv
 
 2. **Clone and build**:
 ```bash
-git clone https://github.com/yourusername/dictation-app.git
+git clone https://github.com/sayhar/dictation-app.git
 cd dictation-app
 uv sync
 uv run python setup.py py2app
