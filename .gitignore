@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# py2app
+build/
+dist/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Generated files
+icon.icns
+icon.iconset/
+icon.png
+
+# Logs (user data)
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary
+*.wav

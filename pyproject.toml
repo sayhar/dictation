@@ -1,0 +1,23 @@
+[project]
+name = "dictation-app"
+version = "1.0.0"
+description = "Local push-to-talk dictation app for macOS using Whisper"
+requires-python = ">=3.12"
+dependencies = [
+    "openai-whisper",
+    "sounddevice",
+    "numpy",
+    "pyobjc-framework-Cocoa",
+    "pyobjc-framework-Quartz",
+    "rumps",
+    "py2app",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pillow",  # For icon generation
+]
+
+[build-system]
+requires = ["setuptools", "py2app"]
+build-backend = "setuptools.build_meta"
