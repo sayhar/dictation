@@ -49,8 +49,8 @@ kVK_RightCommand = 0x36  # Virtual key code for Right Command
 
 # Global state
 is_recording = False
-transcription_lock = threading.Lock()
 is_transcribing = False
+state_lock = threading.Lock()  # Protects all state transitions (replaces transcription_lock and stream_lock)
 audio_data = []
 model = None
 audio_stream = None
@@ -76,21 +76,27 @@ def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
     global audio_data, is_transcribing
 
-    # Atomically claim transcription slot and copy audio data
-    with transcription_lock:
-        if is_transcribing:
-            logging.warning("Transcription already in progress, skipping")
-            return
-        is_transcribing = True
-        # Make local copy to prevent race with next recording clearing audio_data
+    # NOTE: is_transcribing is already set to True by the caller (event tap callback)
+    # This prevents the race condition where multiple threads could start simultaneously
+
+    # Copy audio data and clear for next recording (minimal critical section)
+    with state_lock:
         local_audio_data = audio_data[:]
         audio_data = []  # Clear for next recording
 
     logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
 
+    # Stop stream immediately after capturing data (outside lock to avoid blocking)
+    if audio_stream and audio_stream.active:
+        try:
+            audio_stream.stop()
+            logging.info("Audio stream stopped")
+        except Exception as e:
+            logging.error(f"Failed to stop audio stream: {e}")
+
     if len(local_audio_data) == 0:
         logging.warning("No audio data captured")
-        with transcription_lock:
+        with state_lock:
             is_transcribing = False
         return
 
@@ -159,7 +165,9 @@ def transcribe_audio():
     except Exception as e:
         logging.error(f"Transcription failed: {e}")
     finally:
-        with transcription_lock:
+        # Stream is already stopped at line 91 (right after data capture)
+        # Just reset the transcription flag
+        with state_lock:
             is_transcribing = False
         logging.debug("Transcription completed, ready for next recording")
 
@@ -183,35 +191,44 @@ def key_event_callback(proxy, event_type, event, refcon):
             # Only respond to Right Command
             if right_cmd and not right_command_pressed:
                 right_command_pressed = True
-                if not is_recording and not is_transcribing:
+
+                # Check state and claim recording slot (minimal critical section)
+                should_start = False
+                with state_lock:
+                    if not is_recording and not is_transcribing:
+                        is_recording = True
+                        should_start = True
+                    elif is_transcribing:
+                        logging.debug("Cannot start recording: transcription in progress")
+
+                # Start stream outside lock to avoid blocking
+                if should_start:
                     logging.info("Recording started (Command pressed)")
-                    is_recording = True
-                    # Note: audio_data cleared in transcribe_audio() under lock
-                    # Start audio stream
                     if audio_stream and not audio_stream.active:
                         try:
                             audio_stream.start()
                             logging.info(f"Audio stream started, active={audio_stream.active}")
                         except Exception as e:
                             logging.error(f"Failed to start audio stream: {e}")
-                elif is_transcribing:
-                    logging.debug("Cannot start recording: transcription in progress")
+                            # Rollback on failure
+                            with state_lock:
+                                is_recording = False
             elif not right_cmd and right_command_pressed:
                 right_command_pressed = False
-                if is_recording:
+
+                # Check state and transition to transcription (minimal critical section)
+                should_transcribe = False
+                with state_lock:
+                    if is_recording and not is_transcribing:
+                        is_recording = False
+                        is_transcribing = True
+                        should_transcribe = True
+                    elif is_transcribing:
+                        logging.warning("Transcription already in progress, ignoring release")
+
+                # Spawn transcription thread outside lock
+                if should_transcribe:
                     logging.info("Recording stopped (Command released)")
-                    is_recording = False
-                    # Stop audio stream immediately
-                    logging.debug(f"audio_stream={audio_stream}, active={audio_stream.active if audio_stream else 'N/A'}")
-                    if audio_stream and audio_stream.active:
-                        try:
-                            audio_stream.stop()
-                            logging.info("Audio stream stopped")
-                        except Exception as e:
-                            logging.error(f"Failed to stop audio stream: {e}")
-                    else:
-                        logging.warning(f"Audio stream not active, skipping stop")
-                    # Transcribe in separate thread to avoid blocking
                     threading.Thread(target=transcribe_audio, daemon=True).start()
     except Exception as e:
         logging.error(f"Error in key_event_callback: {e}")
@@ -260,7 +277,7 @@ class DictationApp(rumps.App):
         global is_transcribing
 
         # Check if transcription is in progress
-        with transcription_lock:
+        with state_lock:
             if is_transcribing:
                 logging.warning("Cannot switch model while transcription is in progress")
                 rumps.notification(
