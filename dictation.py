@@ -50,7 +50,8 @@ kVK_RightCommand = 0x36  # Virtual key code for Right Command
 # Global state
 is_recording = False
 is_transcribing = False
-state_lock = threading.Lock()  # Protects all state transitions (replaces transcription_lock and stream_lock)
+state_lock = threading.Lock()  # Protects state transitions (is_recording, is_transcribing)
+audio_lock = threading.Lock()  # Protects audio_data (separate to avoid callback contention)
 audio_data = []
 model = None
 audio_stream = None
@@ -69,9 +70,10 @@ def load_model(model_name=None):
 def audio_callback(indata, frames, time, status):
     """Callback for audio recording"""
     global is_recording
-    # Check recording state under lock and append atomically
-    with state_lock:
-        if is_recording:
+    # Read recording flag (atomic read of bool is safe)
+    # Use separate audio_lock to avoid contention with state transitions
+    if is_recording:
+        with audio_lock:
             audio_data.append(indata.copy())
 
 def transcribe_audio():
@@ -83,7 +85,11 @@ def transcribe_audio():
 
     # Stop stream immediately to free up the recording slot
     # This must happen BEFORE any user can start a new recording
-    if audio_stream and audio_stream.active:
+    # Check stream state under lock to avoid race with stream.start()
+    with state_lock:
+        should_stop = audio_stream and audio_stream.active
+
+    if should_stop:
         try:
             audio_stream.stop()
             logging.info("Audio stream stopped")
@@ -94,8 +100,8 @@ def transcribe_audio():
                 is_transcribing = False
             return
 
-    # Copy audio data and clear for next recording (minimal critical section)
-    with state_lock:
+    # Copy audio data and clear for next recording (use audio_lock)
+    with audio_lock:
         local_audio_data = audio_data[:]
         audio_data = []  # Clear for next recording
 
@@ -211,6 +217,7 @@ def key_event_callback(proxy, event_type, event, refcon):
                 # Start stream outside lock to avoid blocking
                 if should_start:
                     logging.info("Recording started (Command pressed)")
+                    # Check stream state (protected implicitly - audio_stream only set during init)
                     if audio_stream and not audio_stream.active:
                         try:
                             audio_stream.start()
