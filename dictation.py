@@ -69,8 +69,10 @@ def load_model(model_name=None):
 def audio_callback(indata, frames, time, status):
     """Callback for audio recording"""
     global is_recording
-    if is_recording:
-        audio_data.append(indata.copy())
+    # Check recording state under lock and append atomically
+    with state_lock:
+        if is_recording:
+            audio_data.append(indata.copy())
 
 def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
@@ -79,20 +81,25 @@ def transcribe_audio():
     # NOTE: is_transcribing is already set to True by the caller (event tap callback)
     # This prevents the race condition where multiple threads could start simultaneously
 
-    # Copy audio data and clear for next recording (minimal critical section)
-    with state_lock:
-        local_audio_data = audio_data[:]
-        audio_data = []  # Clear for next recording
-
-    logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
-
-    # Stop stream immediately after capturing data (outside lock to avoid blocking)
+    # Stop stream immediately to free up the recording slot
+    # This must happen BEFORE any user can start a new recording
     if audio_stream and audio_stream.active:
         try:
             audio_stream.stop()
             logging.info("Audio stream stopped")
         except Exception as e:
             logging.error(f"Failed to stop audio stream: {e}")
+            # On failure, rollback the transcription state
+            with state_lock:
+                is_transcribing = False
+            return
+
+    # Copy audio data and clear for next recording (minimal critical section)
+    with state_lock:
+        local_audio_data = audio_data[:]
+        audio_data = []  # Clear for next recording
+
+    logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
 
     if len(local_audio_data) == 0:
         logging.warning("No audio data captured")
@@ -165,7 +172,7 @@ def transcribe_audio():
     except Exception as e:
         logging.error(f"Transcription failed: {e}")
     finally:
-        # Stream is already stopped at line 91 (right after data capture)
+        # Stream is already stopped at start of function (line 88)
         # Just reset the transcription flag
         with state_lock:
             is_transcribing = False
@@ -226,7 +233,7 @@ def key_event_callback(proxy, event_type, event, refcon):
                     elif is_transcribing:
                         logging.warning("Transcription already in progress, ignoring release")
 
-                # Spawn transcription thread outside lock
+                # Spawn transcription thread (will stop stream immediately)
                 if should_transcribe:
                     logging.info("Recording stopped (Command released)")
                     threading.Thread(target=transcribe_audio, daemon=True).start()
