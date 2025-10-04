@@ -57,6 +57,7 @@ model = None
 audio_stream = None
 right_command_pressed = False
 current_model = "small"  # Default model
+app_instance = None  # Reference to DictationApp instance for updating icon
 
 def load_model(model_name=None):
     """Load Whisper model"""
@@ -78,42 +79,40 @@ def audio_callback(indata, frames, time, status):
 
 def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
-    global audio_data, is_transcribing
+    global audio_data, is_transcribing, app_instance
 
     # NOTE: is_transcribing is already set to True by the caller (event tap callback)
     # This prevents the race condition where multiple threads could start simultaneously
 
-    # Stop stream immediately to free up the recording slot
-    # This must happen BEFORE any user can start a new recording
-    # Check stream state under lock to avoid race with stream.start()
-    with state_lock:
-        should_stop = audio_stream and audio_stream.active
-
-    if should_stop:
-        try:
-            audio_stream.stop()
-            logging.info("Audio stream stopped")
-        except Exception as e:
-            logging.error(f"Failed to stop audio stream: {e}")
-            # On failure, rollback the transcription state
-            with state_lock:
-                is_transcribing = False
-            return
-
-    # Copy audio data and clear for next recording (use audio_lock)
-    with audio_lock:
-        local_audio_data = audio_data[:]
-        audio_data = []  # Clear for next recording
-
-    logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
-
-    if len(local_audio_data) == 0:
-        logging.warning("No audio data captured")
-        with state_lock:
-            is_transcribing = False
-        return
-
     try:
+        # Update icon to show transcribing state
+        if app_instance:
+            app_instance.title = "💭"  # Thinking emoji
+
+        # Stop stream immediately to free up the recording slot
+        # This must happen BEFORE any user can start a new recording
+        # Check stream state under lock to avoid race with stream.start()
+        with state_lock:
+            should_stop = audio_stream and audio_stream.active
+
+        if should_stop:
+            try:
+                audio_stream.abort()  # Use abort() not stop() - doesn't wait for pending buffers
+                logging.info("Audio stream stopped")
+            except Exception as e:
+                logging.error(f"Failed to stop audio stream: {e}")
+                return
+
+        # Copy audio data and clear for next recording (use audio_lock)
+        with audio_lock:
+            local_audio_data = audio_data[:]
+            audio_data = []  # Clear for next recording
+
+        logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
+
+        if len(local_audio_data) == 0:
+            logging.warning("No audio data captured")
+            return
         # Combine audio chunks
         audio = np.concatenate(local_audio_data, axis=0)
         audio = audio.flatten()
@@ -178,10 +177,12 @@ def transcribe_audio():
     except Exception as e:
         logging.error(f"Transcription failed: {e}")
     finally:
-        # Stream is already stopped at start of function (line 88)
-        # Just reset the transcription flag
+        # Stream is already stopped at start of function
+        # Reset the transcription flag and restore icon
         with state_lock:
             is_transcribing = False
+        if app_instance:
+            app_instance.title = "🎤"  # Restore default icon
         logging.debug("Transcription completed, ready for next recording")
 
 def key_event_callback(proxy, event_type, event, refcon):
@@ -227,6 +228,9 @@ def key_event_callback(proxy, event_type, event, refcon):
                             # Rollback on failure
                             with state_lock:
                                 is_recording = False
+
+                # Consume the Right Command key event (don't pass to system)
+                return None
             elif not right_cmd and right_command_pressed:
                 right_command_pressed = False
 
@@ -244,15 +248,19 @@ def key_event_callback(proxy, event_type, event, refcon):
                 if should_transcribe:
                     logging.info("Recording stopped (Command released)")
                     threading.Thread(target=transcribe_audio, daemon=True).start()
+
+                # Consume the Right Command release event
+                return None
     except Exception as e:
         logging.error(f"Error in key_event_callback: {e}")
 
-    # Return the event unmodified
+    # Pass through other events unmodified
     return event
 
 class DictationApp(rumps.App):
     def __init__(self):
         super(DictationApp, self).__init__("🎤", quit_button=None)
+        self.app_ref = self  # Store reference for callbacks to update icon
 
         # Create model selection submenu
         self.model_menu = {
@@ -378,4 +386,5 @@ class DictationApp(rumps.App):
         rumps.quit_application()
 
 if __name__ == "__main__":
-    DictationApp().run()
+    app_instance = DictationApp()
+    app_instance.run()
