@@ -39,6 +39,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# Set ffmpeg path for bundled app (do this once at startup)
+os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH', '')
+
 # Configuration
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -46,6 +49,7 @@ kVK_RightCommand = 0x36  # Virtual key code for Right Command
 
 # Global state
 is_recording = False
+transcription_lock = threading.Lock()
 is_transcribing = False
 audio_data = []
 model = None
@@ -59,11 +63,6 @@ def load_model(model_name=None):
     if model_name:
         current_model = model_name
     logging.info(f"Loading Whisper model ({current_model})...")
-
-    # Set ffmpeg path for bundled app
-    import os
-    os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH', '')
-
     model = whisper.load_model(current_model)
     logging.info("Model loaded successfully")
 
@@ -77,14 +76,19 @@ def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
     global audio_data, is_transcribing
 
+    with transcription_lock:
+        if is_transcribing:
+            logging.warning("Transcription already in progress, skipping")
+            return
+        is_transcribing = True
+
     logging.debug(f"transcribe_audio called, audio_data chunks: {len(audio_data)}")
 
     if len(audio_data) == 0:
         logging.warning("No audio data captured")
-        is_transcribing = False
+        with transcription_lock:
+            is_transcribing = False
         return
-
-    is_transcribing = True
 
     try:
         # Combine audio chunks
@@ -151,7 +155,8 @@ def transcribe_audio():
     except Exception as e:
         logging.error(f"Transcription failed: {e}")
     finally:
-        is_transcribing = False
+        with transcription_lock:
+            is_transcribing = False
         logging.debug("Transcription completed, ready for next recording")
 
 def key_event_callback(proxy, event_type, event, refcon):
@@ -251,9 +256,11 @@ class DictationApp(rumps.App):
         global is_transcribing
 
         # Check if transcription is in progress
-        if is_transcribing:
-            logging.warning("Cannot switch model while transcription is in progress")
-            return
+        with transcription_lock:
+            if is_transcribing:
+                logging.warning("Cannot switch model while transcription is in progress")
+                # TODO: Show user notification that model switch was blocked
+                return
 
         # Uncheck all models
         for item in self.model_menu.values():
