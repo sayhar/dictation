@@ -39,6 +39,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# Set ffmpeg path for bundled app (do this once at startup)
+os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH', '')
+
 # Configuration
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -46,6 +49,8 @@ kVK_RightCommand = 0x36  # Virtual key code for Right Command
 
 # Global state
 is_recording = False
+transcription_lock = threading.Lock()
+is_transcribing = False
 audio_data = []
 model = None
 audio_stream = None
@@ -69,78 +74,98 @@ def audio_callback(indata, frames, time, status):
 
 def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
-    global audio_data
+    global audio_data, is_transcribing
 
-    logging.debug(f"transcribe_audio called, audio_data chunks: {len(audio_data)}")
+    # Atomically claim transcription slot and copy audio data
+    with transcription_lock:
+        if is_transcribing:
+            logging.warning("Transcription already in progress, skipping")
+            return
+        is_transcribing = True
+        # Make local copy to prevent race with next recording clearing audio_data
+        local_audio_data = audio_data[:]
+        audio_data = []  # Clear for next recording
 
-    if len(audio_data) == 0:
+    logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
+
+    if len(local_audio_data) == 0:
         logging.warning("No audio data captured")
+        with transcription_lock:
+            is_transcribing = False
         return
 
-    # Combine audio chunks
-    audio = np.concatenate(audio_data, axis=0)
-    audio = audio.flatten()
-    logging.debug(f"Audio combined, shape: {audio.shape}")
-
-    # Calculate duration
-    duration_seconds = len(audio) / SAMPLE_RATE
-    logging.debug(f"Audio duration: {duration_seconds:.1f} seconds")
-
-    # Save to temporary file
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        temp_path = f.name
-
-    # Write WAV file
-    with wave.open(temp_path, 'wb') as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)  # 16-bit audio
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes((audio * 32767).astype(np.int16).tobytes())
-
-    logging.debug(f"Saved audio to: {temp_path}")
-
-    # Transcribe
-    logging.info("Starting transcription...")
-    result = model.transcribe(temp_path, language="en")
-    text = result["text"].strip()
-    logging.info(f"Transcribed: '{text}'")
-
-    # Log long transcriptions (>60 seconds) to a separate file
-    if duration_seconds > 60 and text:
-        transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
-        import datetime
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        with open(transcript_log, 'a') as f:
-            f.write(f"\n{'='*80}\n")
-            f.write(f"[{timestamp}] Duration: {duration_seconds:.1f}s\n")
-            f.write(f"{text}\n")
-        logging.info(f"Long transcription ({duration_seconds:.1f}s) saved to transcript log")
-
-    if text:
-        # Type the text directly using AppleScript (preserves clipboard)
-        # Escape quotes and backslashes for AppleScript
-        escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
-        paste_result = subprocess.run([
-            'osascript', '-e',
-            f'tell application "System Events" to keystroke "{escaped_text}"'
-        ], capture_output=True, text=True)
-
-        if paste_result.returncode != 0:
-            logging.error(f"Paste failed: {paste_result.stderr}")
-        else:
-            logging.info("Text typed successfully")
-    else:
-        logging.warning("No text transcribed (empty result)")
-
-    # Clean up temp file
     try:
-        os.unlink(temp_path)
+        # Combine audio chunks
+        audio = np.concatenate(local_audio_data, axis=0)
+        audio = audio.flatten()
+        logging.debug(f"Audio combined, shape: {audio.shape}")
+
+        # Calculate duration
+        duration_seconds = len(audio) / SAMPLE_RATE
+        logging.debug(f"Audio duration: {duration_seconds:.1f} seconds")
+
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            temp_path = f.name
+
+        # Write WAV file
+        with wave.open(temp_path, 'wb') as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)  # 16-bit audio
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+
+        logging.debug(f"Saved audio to: {temp_path}")
+
+        # Transcribe
+        logging.info("Starting transcription...")
+        result = model.transcribe(temp_path, language="en")
+        text = result["text"].strip()
+        logging.info(f"Transcribed: '{text}'")
+
+        # Log long transcriptions (>60 seconds) to a separate file
+        if duration_seconds > 60 and text:
+            transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
+            import datetime
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            with open(transcript_log, 'a') as f:
+                f.write(f"\n{'='*80}\n")
+                f.write(f"[{timestamp}] Duration: {duration_seconds:.1f}s\n")
+                f.write(f"{text}\n")
+            logging.info(f"Long transcription ({duration_seconds:.1f}s) saved to transcript log")
+
+        if text:
+            # Type the text directly using AppleScript (preserves clipboard)
+            # Escape quotes and backslashes for AppleScript
+            escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+            paste_result = subprocess.run([
+                'osascript', '-e',
+                f'tell application "System Events" to keystroke "{escaped_text}"'
+            ], capture_output=True, text=True)
+
+            if paste_result.returncode != 0:
+                logging.error(f"Paste failed: {paste_result.stderr}")
+            else:
+                logging.info("Text typed successfully")
+        else:
+            logging.warning("No text transcribed (empty result)")
+
+        # Clean up temp file
+        try:
+            os.unlink(temp_path)
+        except Exception as e:
+            logging.warning(f"Failed to delete temp file: {e}")
+
     except Exception as e:
-        logging.warning(f"Failed to delete temp file: {e}")
+        logging.error(f"Transcription failed: {e}")
+    finally:
+        with transcription_lock:
+            is_transcribing = False
+        logging.debug("Transcription completed, ready for next recording")
 
 def key_event_callback(proxy, event_type, event, refcon):
     """Callback for CGEvent tap to monitor keyboard events"""
-    global is_recording, audio_data, right_command_pressed
+    global is_recording, is_transcribing, audio_data, right_command_pressed
 
     try:
         from Quartz import CGEventGetFlags, kCGEventFlagMaskCommand
@@ -158,23 +183,34 @@ def key_event_callback(proxy, event_type, event, refcon):
             # Only respond to Right Command
             if right_cmd and not right_command_pressed:
                 right_command_pressed = True
-                if not is_recording:
+                if not is_recording and not is_transcribing:
                     logging.info("Recording started (Command pressed)")
-                    audio_data = []
                     is_recording = True
+                    # Note: audio_data cleared in transcribe_audio() under lock
                     # Start audio stream
                     if audio_stream and not audio_stream.active:
-                        audio_stream.start()
-                        logging.info("Audio stream started")
+                        try:
+                            audio_stream.start()
+                            logging.info(f"Audio stream started, active={audio_stream.active}")
+                        except Exception as e:
+                            logging.error(f"Failed to start audio stream: {e}")
+                elif is_transcribing:
+                    logging.debug("Cannot start recording: transcription in progress")
             elif not right_cmd and right_command_pressed:
                 right_command_pressed = False
                 if is_recording:
                     logging.info("Recording stopped (Command released)")
                     is_recording = False
                     # Stop audio stream immediately
+                    logging.debug(f"audio_stream={audio_stream}, active={audio_stream.active if audio_stream else 'N/A'}")
                     if audio_stream and audio_stream.active:
-                        audio_stream.stop()
-                        logging.info("Audio stream stopped")
+                        try:
+                            audio_stream.stop()
+                            logging.info("Audio stream stopped")
+                        except Exception as e:
+                            logging.error(f"Failed to stop audio stream: {e}")
+                    else:
+                        logging.warning(f"Audio stream not active, skipping stop")
                     # Transcribe in separate thread to avoid blocking
                     threading.Thread(target=transcribe_audio, daemon=True).start()
     except Exception as e:
@@ -221,6 +257,19 @@ class DictationApp(rumps.App):
 
     def change_model(self, sender):
         """Change the Whisper model"""
+        global is_transcribing
+
+        # Check if transcription is in progress
+        with transcription_lock:
+            if is_transcribing:
+                logging.warning("Cannot switch model while transcription is in progress")
+                rumps.notification(
+                    title="Dictation",
+                    subtitle="Cannot switch model",
+                    message="Please wait for current transcription to complete"
+                )
+                return
+
         # Uncheck all models
         for item in self.model_menu.values():
             item.state = False
