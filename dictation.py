@@ -153,13 +153,29 @@ def transcribe_audio():
             logging.info(f"Long transcription ({duration_seconds:.1f}s) saved to transcript log")
 
         if text:
-            # Type the text directly using AppleScript (preserves clipboard)
-            # Escape quotes and backslashes for AppleScript
-            escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+            # Use clipboard + paste to avoid triggering shortcuts
+            # Save current clipboard
+            import pyperclip
+            import time
+            old_clipboard = pyperclip.paste()
+
+            # Set text to clipboard
+            pyperclip.copy(text)
+
+            # Small delay to ensure clipboard is updated
+            time.sleep(0.05)
+
+            # Paste using Cmd+V
             paste_result = subprocess.run([
                 'osascript', '-e',
-                f'tell application "System Events" to keystroke "{escaped_text}"'
+                'tell application "System Events" to keystroke "v" using command down'
             ], capture_output=True, text=True)
+
+            # Wait for paste to complete before restoring clipboard
+            time.sleep(0.1)
+
+            # Restore old clipboard
+            pyperclip.copy(old_clipboard)
 
             if paste_result.returncode != 0:
                 logging.error(f"Paste failed: {paste_result.stderr}")
