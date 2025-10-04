@@ -15,10 +15,9 @@ import os
 import subprocess
 import rumps
 import logging
-import signal
 import sys
 import fcntl
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from Quartz import (
     CGEventMaskBit,
     kCGEventKeyDown,
@@ -116,21 +115,12 @@ def audio_callback(indata, frames, time, status):
     if is_recording:
         audio_data.append(indata.copy())
 
-@contextmanager
-def timeout(seconds):
-    """Context manager for timeout using signals"""
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+# Thread pool executor for running transcription with timeout
+transcription_executor = ThreadPoolExecutor(max_workers=1)
 
-    # Set the signal handler and alarm
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        # Restore the old handler and cancel the alarm
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+def run_transcription(temp_path):
+    """Run the actual Whisper transcription (called in executor)"""
+    return model.transcribe(temp_path, language="en")
 
 def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
@@ -182,12 +172,13 @@ def transcribe_audio():
         # This allows long recordings to complete while catching quick hangs
         timeout_seconds = max(TRANSCRIPTION_TIMEOUT, int(duration_seconds * 2))
 
-        # Transcribe with timeout
+        # Transcribe with timeout using ThreadPoolExecutor
         logging.info(f"Starting transcription (audio: {duration_seconds:.1f}s, timeout: {timeout_seconds}s)...")
-        with timeout(timeout_seconds):
-            result = model.transcribe(temp_path, language="en")
+        future = transcription_executor.submit(run_transcription, temp_path)
+        try:
+            result = future.result(timeout=timeout_seconds)
             text = result["text"].strip()
-        logging.info(f"Transcribed: '{text}'")
+            logging.info(f"Transcribed: '{text}'")
 
         # Log long transcriptions (>60 seconds) to a separate file
         if duration_seconds > 60 and text:
@@ -216,13 +207,14 @@ def transcribe_audio():
         else:
             logging.warning("No text transcribed (empty result)")
 
-    except TimeoutError as e:
-        logging.error(f"Transcription timed out: {e}")
-        rumps.notification(
-            title="Dictation",
-            subtitle="Transcription timed out",
-            message=f"Audio took too long to transcribe. Try a smaller/faster model."
-        )
+        except FuturesTimeoutError:
+            logging.error(f"Transcription timed out after {timeout_seconds}s")
+            rumps.notification(
+                title="Dictation",
+                subtitle="Transcription timed out",
+                message=f"Audio took too long to transcribe. Try a smaller/faster model."
+            )
+            future.cancel()  # Attempt to cancel (may not work if already running)
     except Exception as e:
         logging.error(f"Transcription failed: {e}")
     finally:
