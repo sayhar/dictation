@@ -76,15 +76,19 @@ def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
     global audio_data, is_transcribing
 
+    # Atomically claim transcription slot and copy audio data
     with transcription_lock:
         if is_transcribing:
             logging.warning("Transcription already in progress, skipping")
             return
         is_transcribing = True
+        # Make local copy to prevent race with next recording clearing audio_data
+        local_audio_data = audio_data[:]
+        audio_data = []  # Clear for next recording
 
-    logging.debug(f"transcribe_audio called, audio_data chunks: {len(audio_data)}")
+    logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
 
-    if len(audio_data) == 0:
+    if len(local_audio_data) == 0:
         logging.warning("No audio data captured")
         with transcription_lock:
             is_transcribing = False
@@ -92,7 +96,7 @@ def transcribe_audio():
 
     try:
         # Combine audio chunks
-        audio = np.concatenate(audio_data, axis=0)
+        audio = np.concatenate(local_audio_data, axis=0)
         audio = audio.flatten()
         logging.debug(f"Audio combined, shape: {audio.shape}")
 
@@ -181,8 +185,8 @@ def key_event_callback(proxy, event_type, event, refcon):
                 right_command_pressed = True
                 if not is_recording and not is_transcribing:
                     logging.info("Recording started (Command pressed)")
-                    audio_data = []
                     is_recording = True
+                    # Note: audio_data cleared in transcribe_audio() under lock
                     # Start audio stream
                     if audio_stream and not audio_stream.active:
                         try:
@@ -259,7 +263,11 @@ class DictationApp(rumps.App):
         with transcription_lock:
             if is_transcribing:
                 logging.warning("Cannot switch model while transcription is in progress")
-                # TODO: Show user notification that model switch was blocked
+                rumps.notification(
+                    title="Dictation",
+                    subtitle="Cannot switch model",
+                    message="Please wait for current transcription to complete"
+                )
                 return
 
         # Uncheck all models
