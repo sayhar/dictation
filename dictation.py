@@ -15,6 +15,10 @@ import os
 import subprocess
 import rumps
 import logging
+import signal
+import sys
+import fcntl
+from contextlib import contextmanager
 from Quartz import (
     CGEventMaskBit,
     kCGEventKeyDown,
@@ -39,6 +43,45 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# Single instance lock - ensure only one app instance runs at a time
+LOCK_FILE = os.path.expanduser('~/Library/Application Support/Dictation.lock')
+lock_file_handle = None
+
+def acquire_single_instance_lock():
+    """Try to acquire a lock file to ensure single instance"""
+    global lock_file_handle
+
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+
+    try:
+        lock_file_handle = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file_handle.write(str(os.getpid()))
+        lock_file_handle.flush()
+        logging.info(f"Acquired single instance lock (PID: {os.getpid()})")
+        return True
+    except (IOError, OSError) as e:
+        logging.error(f"Another instance is already running: {e}")
+        rumps.alert(
+            title="Dictation Already Running",
+            message="Another instance of Dictation is already running. Please quit the other instance first.",
+            ok="OK"
+        )
+        return False
+
+def release_single_instance_lock():
+    """Release the single instance lock"""
+    global lock_file_handle
+    if lock_file_handle:
+        try:
+            fcntl.flock(lock_file_handle.fileno(), fcntl.LOCK_UN)
+            lock_file_handle.close()
+            os.unlink(LOCK_FILE)
+            logging.info("Released single instance lock")
+        except Exception as e:
+            logging.warning(f"Failed to release lock: {e}")
+
 # Set ffmpeg path for bundled app (do this once at startup)
 os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH', '')
 
@@ -46,6 +89,7 @@ os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH'
 SAMPLE_RATE = 16000
 CHANNELS = 1
 kVK_RightCommand = 0x36  # Virtual key code for Right Command
+TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 
 # Global state
 is_recording = False
@@ -72,6 +116,22 @@ def audio_callback(indata, frames, time, status):
     if is_recording:
         audio_data.append(indata.copy())
 
+@contextmanager
+def timeout(seconds):
+    """Context manager for timeout using signals"""
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+
+    # Set the signal handler and alarm
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        # Restore the old handler and cancel the alarm
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
 def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
     global audio_data, is_transcribing
@@ -94,6 +154,7 @@ def transcribe_audio():
             is_transcribing = False
         return
 
+    temp_path = None
     try:
         # Combine audio chunks
         audio = np.concatenate(local_audio_data, axis=0)
@@ -117,10 +178,15 @@ def transcribe_audio():
 
         logging.debug(f"Saved audio to: {temp_path}")
 
-        # Transcribe
-        logging.info("Starting transcription...")
-        result = model.transcribe(temp_path, language="en")
-        text = result["text"].strip()
+        # Calculate dynamic timeout: at least 120s, or 2x audio duration, whichever is longer
+        # This allows long recordings to complete while catching quick hangs
+        timeout_seconds = max(TRANSCRIPTION_TIMEOUT, int(duration_seconds * 2))
+
+        # Transcribe with timeout
+        logging.info(f"Starting transcription (audio: {duration_seconds:.1f}s, timeout: {timeout_seconds}s)...")
+        with timeout(timeout_seconds):
+            result = model.transcribe(temp_path, language="en")
+            text = result["text"].strip()
         logging.info(f"Transcribed: '{text}'")
 
         # Log long transcriptions (>60 seconds) to a separate file
@@ -150,15 +216,23 @@ def transcribe_audio():
         else:
             logging.warning("No text transcribed (empty result)")
 
-        # Clean up temp file
-        try:
-            os.unlink(temp_path)
-        except Exception as e:
-            logging.warning(f"Failed to delete temp file: {e}")
-
+    except TimeoutError as e:
+        logging.error(f"Transcription timed out: {e}")
+        rumps.notification(
+            title="Dictation",
+            subtitle="Transcription timed out",
+            message=f"Audio took too long to transcribe. Try a smaller/faster model."
+        )
     except Exception as e:
         logging.error(f"Transcription failed: {e}")
     finally:
+        # Clean up temp file
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except Exception as e:
+                logging.warning(f"Failed to delete temp file: {e}")
+
         with transcription_lock:
             is_transcribing = False
         logging.debug("Transcription completed, ready for next recording")
@@ -342,9 +416,15 @@ class DictationApp(rumps.App):
     def quit_app(self, _):
         """Quit the app"""
         logging.info("Quit requested")
-        # Just call rumps.quit_application directly - no cleanup
-        # The OS will handle resource cleanup
+        release_single_instance_lock()
         rumps.quit_application()
 
 if __name__ == "__main__":
-    DictationApp().run()
+    # Ensure only one instance runs at a time
+    if not acquire_single_instance_lock():
+        sys.exit(1)
+
+    try:
+        DictationApp().run()
+    finally:
+        release_single_instance_lock()
