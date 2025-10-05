@@ -108,6 +108,7 @@ recording_lock = threading.Lock()  # Protects recording_buffer
 model = None
 audio_stream = None
 right_command_pressed = False
+typing_in_progress = False  # Flag to block Right Command during typing
 current_model = "small"  # Default model
 app_instance = None  # Reference to DictationApp instance for updating icon
 
@@ -337,30 +338,40 @@ def type_text(text):
     """
     Type text using AppleScript keystroke.
 
-    CRITICAL: This should only be called when Command is NOT held.
-    The state manager ensures this by checking command_held before calling.
+    Sets typing_in_progress flag to block Right Command events during typing.
+    This prevents shortcuts (Cmd+T, Cmd+A, etc.) from triggering while text is being typed.
     """
+    global typing_in_progress
+
     if not text:
         return
 
-    # Escape for AppleScript
-    escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+    # Set flag to block Right Command events during typing
+    typing_in_progress = True
 
-    logging.info(f"Typing text: {len(text)} chars")
-    result = subprocess.run([
-        'osascript', '-e',
-        f'tell application "System Events" to keystroke "{escaped_text}"'
-    ], capture_output=True, text=True)
+    try:
+        # Escape for AppleScript
+        escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
 
-    if result.returncode != 0:
-        logging.error(f"Failed to type text: {result.stderr}")
-    else:
-        logging.info("Text typed successfully")
+        logging.info(f"Typing text: {len(text)} chars (Right Command blocked)")
+        result = subprocess.run([
+            'osascript', '-e',
+            f'tell application "System Events" to keystroke "{escaped_text}"'
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logging.error(f"Failed to type text: {result.stderr}")
+        else:
+            logging.info("Text typed successfully")
+    finally:
+        # Always clear flag, even if typing failed
+        typing_in_progress = False
+        logging.debug("Typing completed, Right Command unblocked")
 
 
 def key_event_callback(proxy, event_type, event, refcon):
-    """Callback for CGEvent tap - just posts commands to queue"""
-    global right_command_pressed
+    """Callback for CGEvent tap - posts commands to queue and blocks Right Command during typing"""
+    global right_command_pressed, typing_in_progress
 
     try:
         from Quartz import CGEventGetFlags, kCGEventFlagMaskCommand
@@ -370,6 +381,13 @@ def key_event_callback(proxy, event_type, event, refcon):
             command_pressed = (flags & kCGEventFlagMaskCommand) != 0
             left_cmd = command_pressed and (flags & 0x0008) != 0
             right_cmd = command_pressed and not left_cmd
+
+            # Block Right Command events while typing is in progress
+            # This prevents Cmd+T, Cmd+A, etc. shortcuts during text insertion
+            # Left Command is NOT blocked - provides safety valve (Cmd+Q still works)
+            if typing_in_progress and right_cmd:
+                logging.debug("Blocked Right Command event during typing")
+                return None  # Consume the event
 
             if right_cmd and not right_command_pressed:
                 right_command_pressed = True
