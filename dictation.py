@@ -19,6 +19,7 @@ import sys
 import fcntl
 import atexit
 import datetime
+import queue
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from Quartz import (
     CGEventMaskBit,
@@ -100,17 +101,19 @@ CHANNELS = 1
 kVK_RightCommand = 0x36  # Virtual key code for Right Command
 TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 
-# Global state
-is_recording = False
-is_transcribing = False
-state_lock = threading.Lock()  # Protects state transitions (is_recording, is_transcribing)
-audio_lock = threading.Lock()  # Protects audio_data (separate to avoid callback contention)
-audio_data = []
+# Global state (queue-based architecture)
+command_queue = queue.Queue()  # Commands from event tap
+recording_buffer = None  # None = not recording, list = currently recording
+recording_lock = threading.Lock()  # Protects recording_buffer
 model = None
 audio_stream = None
 right_command_pressed = False
 current_model = "small"  # Default model
 app_instance = None  # Reference to DictationApp instance for updating icon
+
+# Thread pool executor for running transcription with timeout
+# Use max_workers=2 to allow one timeout to run while a new transcription starts
+transcription_executor = ThreadPoolExecutor(max_workers=2)
 
 def load_model(model_name=None):
     """Load Whisper model"""
@@ -122,228 +125,265 @@ def load_model(model_name=None):
     logging.info("Model loaded successfully")
 
 def audio_callback(indata, frames, time, status):
-    """Callback for audio recording"""
-    global is_recording
-    # Read recording flag (atomic read of bool is safe)
-    # Use separate audio_lock to avoid contention with state transitions
-    if is_recording:
-        with audio_lock:
-            audio_data.append(indata.copy())
+    """
+    Callback for audio recording (runs on sounddevice thread)
+
+    This is called ~100 times/second when audio stream is active.
+    Simply appends audio data to the recording buffer - no complex logic.
+    """
+    with recording_lock:
+        if recording_buffer is not None:
+            recording_buffer.append(indata.copy())
 
 # Thread pool executor for running transcription with timeout
 # Use max_workers=2 to allow one timeout to run while a new transcription starts
 # This prevents blocking the user if a transcription hangs
 transcription_executor = ThreadPoolExecutor(max_workers=2)
 
-def run_transcription(temp_path):
-    """Run the actual Whisper transcription (called in executor)"""
-    return model.transcribe(temp_path, language="en")
+def state_manager():
+    """
+    Main state machine - runs on dedicated thread.
 
-def transcribe_audio():
-    """Transcribe recorded audio using Whisper"""
-    global audio_data, is_transcribing, app_instance
+    Handles all state transitions in one place.
+    Purely event-driven - 0% CPU when blocked on queue.get()
+    """
+    global recording_buffer  # Declare at function start
+    state = 'IDLE'  # States: IDLE, RECORDING, TRANSCRIBING
+    pending_text = None  # Text waiting for Command release
+    command_held = False  # Is Right Command currently pressed?
 
-    # NOTE: is_transcribing is already set to True by the caller (event tap callback)
-    # This prevents the race condition where multiple threads could start simultaneously
+    logging.info("State manager started")
+
+    while True:
+        try:
+            # ALWAYS BLOCK - no timeouts, no polling!
+            # This is 0% CPU whether idle, recording, or transcribing
+            msg = command_queue.get()
+
+            logging.debug(f"State manager: state={state}, msg={msg}, command_held={command_held}")
+
+            # Handle COMMAND_DOWN
+            if msg == 'COMMAND_DOWN':
+                command_held = True
+
+                if state == 'IDLE':
+                    # Start recording
+                    state = 'RECORDING'
+                    with recording_lock:
+                        recording_buffer = []
+
+                    if audio_stream and not audio_stream.active:
+                        try:
+                            audio_stream.start()
+                            logging.info("Recording started")
+                            if app_instance:
+                                app_instance.title = "🎤"
+                        except Exception as e:
+                            logging.error(f"Failed to start audio stream: {e}")
+                            with recording_lock:
+                                recording_buffer = None
+                            state = 'IDLE'
+
+                elif state == 'TRANSCRIBING':
+                    # User pressed Command while transcribing - ignore for now
+                    logging.debug("Command pressed during transcription - ignoring")
+
+            # Handle COMMAND_UP
+            elif msg == 'COMMAND_UP':
+                command_held = False
+
+                if state == 'RECORDING':
+                    # Stop recording, start transcription
+                    state = 'TRANSCRIBING'
+
+                    # Grab the recorded audio
+                    with recording_lock:
+                        recorded_audio = recording_buffer[:]
+                        recording_buffer = None  # Stop recording
+
+                    # Stop audio stream
+                    if audio_stream and audio_stream.active:
+                        try:
+                            audio_stream.abort()
+                            logging.info("Recording stopped")
+                        except Exception as e:
+                            logging.error(f"Failed to stop audio stream: {e}")
+
+                    # Update icon
+                    if app_instance:
+                        app_instance.title = "💭"
+
+                    # Spawn transcription thread
+                    def do_transcription():
+                        try:
+                            result = transcribe_recorded_audio(recorded_audio)
+                            command_queue.put(('TRANSCRIPTION_DONE', result))
+                        except Exception as e:
+                            logging.error(f"Transcription failed: {e}")
+                            command_queue.put(('TRANSCRIPTION_DONE', ""))
+
+                    threading.Thread(target=do_transcription, daemon=True).start()
+                    logging.info("Transcription started")
+
+                # If we have pending text, type it now
+                if pending_text:
+                    type_text(pending_text)
+                    pending_text = None
+                    if app_instance:
+                        app_instance.title = "🎤"
+                    logging.info("Typed pending text after Command release")
+
+            # Handle TRANSCRIPTION_DONE
+            elif isinstance(msg, tuple) and msg[0] == 'TRANSCRIPTION_DONE':
+                text = msg[1]
+
+                if command_held:
+                    # User is still holding Command - queue the text
+                    pending_text = text
+                    if app_instance:
+                        app_instance.title = "⏸️"  # Paused icon
+                    logging.info(f"Transcription done, but Command held - text queued (length: {len(text)})")
+                else:
+                    # Safe to type immediately
+                    type_text(text)
+                    if app_instance:
+                        app_instance.title = "🎤"
+                    logging.info("Transcription done, text typed")
+
+                state = 'IDLE'
+
+        except Exception as e:
+            logging.error(f"State manager error: {e}", exc_info=True)
+            # Reset state to IDLE on errors
+            state = 'IDLE'
+            pending_text = None
+
+def transcribe_recorded_audio(audio_chunks):
+    """
+    Transcribe audio chunks (runs in background thread).
+
+    This is the actual Whisper transcription with timeout handling.
+    Posts result back to command_queue when done.
+    """
+    if len(audio_chunks) == 0:
+        logging.warning("No audio data captured")
+        return ""
 
     try:
-        # Update icon to show transcribing state
-        if app_instance:
-            app_instance.title = "💭"  # Thinking emoji
-
-        # Stop stream immediately to free up the recording slot
-        # This must happen BEFORE any user can start a new recording
-        # Check stream state under lock to avoid race with stream.start()
-        with state_lock:
-            should_stop = audio_stream and audio_stream.active
-
-        if should_stop:
-            try:
-                audio_stream.abort()  # Use abort() not stop() - doesn't wait for pending buffers
-                logging.info("Audio stream stopped")
-            except Exception as e:
-                logging.error(f"Failed to stop audio stream: {e}")
-                # Continue with transcription - audio already captured
-
-        # Copy audio data and clear for next recording (use audio_lock)
-        with audio_lock:
-            local_audio_data = audio_data[:]
-            audio_data = []  # Clear for next recording
-
-        logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
-
-        if len(local_audio_data) == 0:
-            logging.warning("No audio data captured")
-            return
-
         # Combine audio chunks
-        audio = np.concatenate(local_audio_data, axis=0)
+        audio = np.concatenate(audio_chunks, axis=0)
         audio = audio.flatten()
-        logging.debug(f"Audio combined, shape: {audio.shape}")
-
-        # Calculate duration
         duration_seconds = len(audio) / SAMPLE_RATE
-        logging.debug(f"Audio duration: {duration_seconds:.1f} seconds")
+        logging.debug(f"Audio combined: {duration_seconds:.1f}s")
 
         # Save to temporary file
         temp_path = None
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            temp_path = f.name
-
-        # Write WAV file
-        with wave.open(temp_path, 'wb') as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # 16-bit audio
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes((audio * 32767).astype(np.int16).tobytes())
-
-        logging.debug(f"Saved audio to: {temp_path}")
-
-        # Calculate dynamic timeout: at least 120s, or 2x audio duration, whichever is longer
-        # This allows long recordings to complete while catching quick hangs
-        timeout_seconds = max(TRANSCRIPTION_TIMEOUT, int(duration_seconds * 2))
-
-        # Transcribe with timeout using ThreadPoolExecutor
-        logging.info(f"Starting transcription (audio: {duration_seconds:.1f}s, timeout: {timeout_seconds}s)...")
-        future = transcription_executor.submit(run_transcription, temp_path)
         try:
-            result = future.result(timeout=timeout_seconds)
-            text = result["text"].strip()
-            logging.info(f"Transcribed: '{text}'")
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_path = f.name
 
-            # Log long transcriptions (>60 seconds) to a separate file
-            if duration_seconds > 60 and text:
-                transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
-                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                with open(transcript_log, 'a') as f:
-                    f.write(f"\n{'='*80}\n")
-                    f.write(f"[{timestamp}] Duration: {duration_seconds:.1f}s\n")
-                    f.write(f"{text}\n")
-                logging.info(f"Long transcription ({duration_seconds:.1f}s) saved to transcript log")
+            with wave.open(temp_path, 'wb') as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes((audio * 32767).astype(np.int16).tobytes())
 
-            if text:
-                # Type the text directly using AppleScript (preserves clipboard)
-                # Escape quotes and backslashes for AppleScript
-                escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
-                paste_result = subprocess.run([
-                    'osascript', '-e',
-                    f'tell application "System Events" to keystroke "{escaped_text}"'
-                ], capture_output=True, text=True)
+            # Calculate timeout
+            timeout_seconds = max(TRANSCRIPTION_TIMEOUT, int(duration_seconds * 2))
 
-                if paste_result.returncode != 0:
-                    logging.error(f"Paste failed: {paste_result.stderr}")
-                else:
-                    logging.info("Text typed successfully")
-            else:
-                logging.warning("No text transcribed (empty result)")
+            # Transcribe with timeout
+            logging.info(f"Starting transcription (audio: {duration_seconds:.1f}s, timeout: {timeout_seconds}s)")
+            future = transcription_executor.submit(lambda: model.transcribe(temp_path, language="en"))
 
-        except FuturesTimeoutError:
-            logging.error(f"Transcription timed out after {timeout_seconds}s")
-            rumps.notification(
-                title="Dictation",
-                subtitle="Transcription timed out",
-                message=f"Audio took too long to transcribe. Try a smaller/faster model."
-            )
-            # KNOWN LIMITATION: Thread leak on timeout
-            # future.cancel() only works if the task hasn't started executing yet.
-            # Once Whisper is running, the thread continues until completion (potentially 10+ min).
-            # This can accumulate zombie threads if multiple timeouts occur.
-            # Solution: Use ProcessPoolExecutor for true process termination (planned refactor).
-            # For now: max_workers=2 prevents blocking, leaked threads eventually complete.
-            was_cancelled = future.cancel()
-            if not was_cancelled:
-                logging.warning("Could not cancel running transcription thread - it will complete in background")
-            else:
-                logging.info("Transcription future cancelled successfully")
-    except Exception as e:
-        logging.error(f"Transcription failed: {e}")
-    finally:
-        # Clean up temp file
-        if temp_path:
             try:
-                os.unlink(temp_path)
-            except Exception as e:
-                logging.warning(f"Failed to delete temp file: {e}")
+                result = future.result(timeout=timeout_seconds)
+                text = result["text"].strip()
+                logging.info(f"Transcribed: '{text}'")
 
-        # Stream is already stopped at start of function
-        # Reset the transcription flag and restore icon
-        with state_lock:
-            is_transcribing = False
-        if app_instance:
-            app_instance.title = "🎤"  # Restore default icon
-        logging.debug("Transcription completed, ready for next recording")
+                # Log long transcriptions
+                if duration_seconds > 60 and text:
+                    transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
+                    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    with open(transcript_log, 'a') as f:
+                        f.write(f"\n{'='*80}\n")
+                        f.write(f"[{timestamp}] Duration: {duration_seconds:.1f}s\n")
+                        f.write(f"{text}\n")
+
+                return text
+
+            except FuturesTimeoutError:
+                logging.error(f"Transcription timed out after {timeout_seconds}s")
+                rumps.notification(
+                    title="Dictation",
+                    subtitle="Transcription timed out",
+                    message=f"Audio took too long to transcribe. Try a smaller/faster model."
+                )
+                future.cancel()
+                return ""
+
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except Exception as e:
+                    logging.warning(f"Failed to delete temp file: {e}")
+
+    except Exception as e:
+        logging.error(f"Transcription error: {e}")
+        return ""
+
+def type_text(text):
+    """
+    Type text using AppleScript keystroke.
+
+    CRITICAL: This should only be called when Command is NOT held.
+    The state manager ensures this by checking command_held before calling.
+    """
+    if not text:
+        return
+
+    # Escape for AppleScript
+    escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+
+    logging.info(f"Typing text: {len(text)} chars")
+    result = subprocess.run([
+        'osascript', '-e',
+        f'tell application "System Events" to keystroke "{escaped_text}"'
+    ], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        logging.error(f"Failed to type text: {result.stderr}")
+    else:
+        logging.info("Text typed successfully")
+
 
 def key_event_callback(proxy, event_type, event, refcon):
-    """Callback for CGEvent tap to monitor keyboard events"""
-    global is_recording, is_transcribing, audio_data, right_command_pressed
+    """Callback for CGEvent tap - just posts commands to queue"""
+    global right_command_pressed
 
     try:
         from Quartz import CGEventGetFlags, kCGEventFlagMaskCommand
 
-        # For modifier keys, check the flags instead of keycode
         if event_type == kCGEventFlagsChanged:
             flags = CGEventGetFlags(event)
             command_pressed = (flags & kCGEventFlagMaskCommand) != 0
-            # Left Command has flag 0x0008, Right Command does NOT have 0x0008
             left_cmd = command_pressed and (flags & 0x0008) != 0
             right_cmd = command_pressed and not left_cmd
 
-            logging.debug(f"Flags changed: flags={hex(flags)}, command={command_pressed}, left={left_cmd}, right={right_cmd}")
-
-            # Only respond to Right Command
             if right_cmd and not right_command_pressed:
                 right_command_pressed = True
+                command_queue.put('COMMAND_DOWN')
+                return None  # Consume event
 
-                # Check state and claim recording slot (minimal critical section)
-                should_start = False
-                with state_lock:
-                    if not is_recording and not is_transcribing:
-                        is_recording = True
-                        should_start = True
-                    elif is_transcribing:
-                        logging.debug("Cannot start recording: transcription in progress")
-
-                # Start stream outside lock to avoid blocking
-                if should_start:
-                    logging.info("Recording started (Command pressed)")
-                    # Check stream state (protected implicitly - audio_stream only set during init)
-                    if audio_stream and not audio_stream.active:
-                        try:
-                            audio_stream.start()
-                            logging.info(f"Audio stream started, active={audio_stream.active}")
-                        except Exception as e:
-                            logging.error(f"Failed to start audio stream: {e}")
-                            # Rollback on failure
-                            with state_lock:
-                                is_recording = False
-
-                # Consume the Right Command key event (don't pass to system)
-                return None
             elif not right_cmd and right_command_pressed:
                 right_command_pressed = False
+                command_queue.put('COMMAND_UP')
+                return None  # Consume event
 
-                # Check state and transition to transcription (minimal critical section)
-                should_transcribe = False
-                with state_lock:
-                    if is_recording and not is_transcribing:
-                        is_recording = False
-                        is_transcribing = True
-                        should_transcribe = True
-                    elif is_transcribing:
-                        logging.warning("Transcription already in progress, ignoring release")
-
-                # Spawn transcription thread (will stop stream immediately)
-                if should_transcribe:
-                    logging.info("Recording stopped (Command released)")
-                    threading.Thread(target=transcribe_audio, daemon=True).start()
-
-                # Consume the Right Command release event
-                return None
     except Exception as e:
         logging.error(f"Error in key_event_callback: {e}")
 
-    # Pass through other events unmodified
-    return event
+    return event  # Pass through other events
 
 class DictationApp(rumps.App):
     def __init__(self):
@@ -383,18 +423,8 @@ class DictationApp(rumps.App):
 
     def change_model(self, sender):
         """Change the Whisper model"""
-        global is_transcribing
-
-        # Check if transcription is in progress
-        with state_lock:
-            if is_transcribing:
-                logging.warning("Cannot switch model while transcription is in progress")
-                rumps.notification(
-                    title="Dictation",
-                    subtitle="Cannot switch model",
-                    message="Please wait for current transcription to complete"
-                )
-                return
+        # Note: Model switching is safe - the model is only used during transcription
+        # and each transcription gets a reference to the model at the start
 
         # Uncheck all models
         for item in self.model_menu.values():
@@ -463,6 +493,10 @@ class DictationApp(rumps.App):
         )
         audio_stream = self.audio_stream  # Keep global reference for callbacks
         logging.info("Audio stream created (will start on key press)")
+
+        # Start state manager thread
+        threading.Thread(target=state_manager, daemon=True).start()
+        logging.info("State manager thread started")
 
     @rumps.clicked("Quit")
     def quit_app(self, _):
