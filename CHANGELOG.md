@@ -21,7 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 - **TOCTOU race conditions** - Restored atomic claim pattern with check-and-set inside locks (PR #2)
 - **Lock contention in audio callback** - Dual lock strategy (state_lock + audio_lock) eliminates blocking in time-sensitive audio callback
-- **Clipboard preservation** - Switched to clipboard+paste method to avoid triggering shortcuts during text insertion (PR #3)
+- **Clipboard preservation** - Reverted to AppleScript keystroke approach (preserves clipboard). Event consumption (return None) prevents shortcuts from triggering during dictation
 - **Stream state races** - All stream operations now check state under lock to prevent races with start/stop
 - **State transitions** - Proper rollback on stream start failure
 

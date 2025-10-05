@@ -11,7 +11,7 @@ A lightweight, local push-to-talk dictation app for macOS using OpenAI's Whisper
 - 📋 **Long Transcript Log**: Automatically saves transcriptions >60 seconds to `~/Library/Logs/Dictation_Transcripts.log`
 - 🎨 **Menu Bar App**: Runs quietly in the background with a clean menu bar interface
 - 💭 **Visual Feedback**: Icon changes to show transcription status (💭 thinking, 🎤 ready)
-- ⏱️ **Timeout Protection**: Automatic timeout prevents hangs on problematic audio
+- ⏱️ **Timeout Protection**: Automatic timeout prevents hangs on problematic audio (note: timed-out transcriptions continue in background - see CHANGELOG)
 - 🛡️ **Single Instance**: Prevents conflicts from multiple app instances running simultaneously
 - ⚡ **Auto-start**: Can be configured to launch on login
 
