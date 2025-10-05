@@ -191,18 +191,24 @@ def state_manager():
                     # Stop recording, start transcription
                     state = 'TRANSCRIBING'
 
-                    # Grab the recorded audio
-                    with recording_lock:
-                        recorded_audio = recording_buffer[:]
-                        recording_buffer = None  # Stop recording
-
-                    # Stop audio stream
+                    # Stop audio stream and wait for it to actually stop
                     if audio_stream and audio_stream.active:
                         try:
-                            audio_stream.abort()
+                            audio_stream.stop()  # Blocks until stream is stopped
                             logging.info("Recording stopped")
                         except Exception as e:
                             logging.error(f"Failed to stop audio stream: {e}")
+
+                    # Wait for any in-flight callbacks to complete
+                    # The callback might have been scheduled before stop() was called
+                    # 50ms = 5 callback cycles at 100/sec - very safe
+                    import time
+                    time.sleep(0.05)
+
+                    # Now grab the recorded audio
+                    with recording_lock:
+                        recorded_audio = recording_buffer[:]
+                        recording_buffer = None  # Stop recording
 
                     # Update icon
                     if app_instance:
