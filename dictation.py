@@ -17,6 +17,7 @@ import rumps
 import logging
 import sys
 import fcntl
+import atexit
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from Quartz import (
     CGEventMaskBit,
@@ -59,9 +60,17 @@ def acquire_single_instance_lock():
         lock_file_handle.write(str(os.getpid()))
         lock_file_handle.flush()
         logging.info(f"Acquired single instance lock (PID: {os.getpid()})")
+        # Register cleanup on exit
+        atexit.register(release_single_instance_lock)
         return True
     except (IOError, OSError) as e:
         logging.error(f"Another instance is already running: {e}")
+        # Close the file handle if we failed to acquire the lock
+        if lock_file_handle:
+            try:
+                lock_file_handle.close()
+            except:
+                pass
         rumps.alert(
             title="Dictation Already Running",
             message="Another instance of Dictation is already running. Please quit the other instance first.",
@@ -92,13 +101,15 @@ TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 
 # Global state
 is_recording = False
-transcription_lock = threading.Lock()
 is_transcribing = False
+state_lock = threading.Lock()  # Protects state transitions (is_recording, is_transcribing)
+audio_lock = threading.Lock()  # Protects audio_data (separate to avoid callback contention)
 audio_data = []
 model = None
 audio_stream = None
 right_command_pressed = False
 current_model = "small"  # Default model
+app_instance = None  # Reference to DictationApp instance for updating icon
 
 def load_model(model_name=None):
     """Load Whisper model"""
@@ -112,11 +123,16 @@ def load_model(model_name=None):
 def audio_callback(indata, frames, time, status):
     """Callback for audio recording"""
     global is_recording
+    # Read recording flag (atomic read of bool is safe)
+    # Use separate audio_lock to avoid contention with state transitions
     if is_recording:
-        audio_data.append(indata.copy())
+        with audio_lock:
+            audio_data.append(indata.copy())
 
 # Thread pool executor for running transcription with timeout
-transcription_executor = ThreadPoolExecutor(max_workers=1)
+# Use max_workers=2 to allow one timeout to run while a new transcription starts
+# This prevents blocking the user if a transcription hangs
+transcription_executor = ThreadPoolExecutor(max_workers=2)
 
 def run_transcription(temp_path):
     """Run the actual Whisper transcription (called in executor)"""
@@ -124,28 +140,41 @@ def run_transcription(temp_path):
 
 def transcribe_audio():
     """Transcribe recorded audio using Whisper"""
-    global audio_data, is_transcribing
+    global audio_data, is_transcribing, app_instance
 
-    # Atomically claim transcription slot and copy audio data
-    with transcription_lock:
-        if is_transcribing:
-            logging.warning("Transcription already in progress, skipping")
-            return
-        is_transcribing = True
-        # Make local copy to prevent race with next recording clearing audio_data
-        local_audio_data = audio_data[:]
-        audio_data = []  # Clear for next recording
+    # NOTE: is_transcribing is already set to True by the caller (event tap callback)
+    # This prevents the race condition where multiple threads could start simultaneously
 
-    logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
-
-    if len(local_audio_data) == 0:
-        logging.warning("No audio data captured")
-        with transcription_lock:
-            is_transcribing = False
-        return
-
-    temp_path = None
     try:
+        # Update icon to show transcribing state
+        if app_instance:
+            app_instance.title = "💭"  # Thinking emoji
+
+        # Stop stream immediately to free up the recording slot
+        # This must happen BEFORE any user can start a new recording
+        # Check stream state under lock to avoid race with stream.start()
+        with state_lock:
+            should_stop = audio_stream and audio_stream.active
+
+        if should_stop:
+            try:
+                audio_stream.abort()  # Use abort() not stop() - doesn't wait for pending buffers
+                logging.info("Audio stream stopped")
+            except Exception as e:
+                logging.error(f"Failed to stop audio stream: {e}")
+                return
+
+        # Copy audio data and clear for next recording (use audio_lock)
+        with audio_lock:
+            local_audio_data = audio_data[:]
+            audio_data = []  # Clear for next recording
+
+        logging.debug(f"transcribe_audio called, audio_data chunks: {len(local_audio_data)}")
+
+        if len(local_audio_data) == 0:
+            logging.warning("No audio data captured")
+            return
+
         # Combine audio chunks
         audio = np.concatenate(local_audio_data, axis=0)
         audio = audio.flatten()
@@ -156,6 +185,7 @@ def transcribe_audio():
         logging.debug(f"Audio duration: {duration_seconds:.1f} seconds")
 
         # Save to temporary file
+        temp_path = None
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             temp_path = f.name
 
@@ -180,32 +210,32 @@ def transcribe_audio():
             text = result["text"].strip()
             logging.info(f"Transcribed: '{text}'")
 
-        # Log long transcriptions (>60 seconds) to a separate file
-        if duration_seconds > 60 and text:
-            transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
-            import datetime
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            with open(transcript_log, 'a') as f:
-                f.write(f"\n{'='*80}\n")
-                f.write(f"[{timestamp}] Duration: {duration_seconds:.1f}s\n")
-                f.write(f"{text}\n")
-            logging.info(f"Long transcription ({duration_seconds:.1f}s) saved to transcript log")
+            # Log long transcriptions (>60 seconds) to a separate file
+            if duration_seconds > 60 and text:
+                transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
+                import datetime
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                with open(transcript_log, 'a') as f:
+                    f.write(f"\n{'='*80}\n")
+                    f.write(f"[{timestamp}] Duration: {duration_seconds:.1f}s\n")
+                    f.write(f"{text}\n")
+                logging.info(f"Long transcription ({duration_seconds:.1f}s) saved to transcript log")
 
-        if text:
-            # Type the text directly using AppleScript (preserves clipboard)
-            # Escape quotes and backslashes for AppleScript
-            escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
-            paste_result = subprocess.run([
-                'osascript', '-e',
-                f'tell application "System Events" to keystroke "{escaped_text}"'
-            ], capture_output=True, text=True)
+            if text:
+                # Type the text directly using AppleScript (preserves clipboard)
+                # Escape quotes and backslashes for AppleScript
+                escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+                paste_result = subprocess.run([
+                    'osascript', '-e',
+                    f'tell application "System Events" to keystroke "{escaped_text}"'
+                ], capture_output=True, text=True)
 
-            if paste_result.returncode != 0:
-                logging.error(f"Paste failed: {paste_result.stderr}")
+                if paste_result.returncode != 0:
+                    logging.error(f"Paste failed: {paste_result.stderr}")
+                else:
+                    logging.info("Text typed successfully")
             else:
-                logging.info("Text typed successfully")
-        else:
-            logging.warning("No text transcribed (empty result)")
+                logging.warning("No text transcribed (empty result)")
 
         except FuturesTimeoutError:
             logging.error(f"Transcription timed out after {timeout_seconds}s")
@@ -214,7 +244,13 @@ def transcribe_audio():
                 subtitle="Transcription timed out",
                 message=f"Audio took too long to transcribe. Try a smaller/faster model."
             )
-            future.cancel()  # Attempt to cancel (may not work if already running)
+            # Attempt to cancel - won't work if already running, but prevents queueing
+            # The thread will continue running in the background until Whisper completes
+            was_cancelled = future.cancel()
+            if not was_cancelled:
+                logging.warning("Could not cancel running transcription thread - it will complete in background")
+            else:
+                logging.info("Transcription future cancelled successfully")
     except Exception as e:
         logging.error(f"Transcription failed: {e}")
     finally:
@@ -225,8 +261,12 @@ def transcribe_audio():
             except Exception as e:
                 logging.warning(f"Failed to delete temp file: {e}")
 
-        with transcription_lock:
+        # Stream is already stopped at start of function
+        # Reset the transcription flag and restore icon
+        with state_lock:
             is_transcribing = False
+        if app_instance:
+            app_instance.title = "🎤"  # Restore default icon
         logging.debug("Transcription completed, ready for next recording")
 
 def key_event_callback(proxy, event_type, event, refcon):
@@ -249,45 +289,62 @@ def key_event_callback(proxy, event_type, event, refcon):
             # Only respond to Right Command
             if right_cmd and not right_command_pressed:
                 right_command_pressed = True
-                if not is_recording and not is_transcribing:
+
+                # Check state and claim recording slot (minimal critical section)
+                should_start = False
+                with state_lock:
+                    if not is_recording and not is_transcribing:
+                        is_recording = True
+                        should_start = True
+                    elif is_transcribing:
+                        logging.debug("Cannot start recording: transcription in progress")
+
+                # Start stream outside lock to avoid blocking
+                if should_start:
                     logging.info("Recording started (Command pressed)")
-                    is_recording = True
-                    # Note: audio_data cleared in transcribe_audio() under lock
-                    # Start audio stream
+                    # Check stream state (protected implicitly - audio_stream only set during init)
                     if audio_stream and not audio_stream.active:
                         try:
                             audio_stream.start()
                             logging.info(f"Audio stream started, active={audio_stream.active}")
                         except Exception as e:
                             logging.error(f"Failed to start audio stream: {e}")
-                elif is_transcribing:
-                    logging.debug("Cannot start recording: transcription in progress")
+                            # Rollback on failure
+                            with state_lock:
+                                is_recording = False
+
+                # Consume the Right Command key event (don't pass to system)
+                return None
             elif not right_cmd and right_command_pressed:
                 right_command_pressed = False
-                if is_recording:
+
+                # Check state and transition to transcription (minimal critical section)
+                should_transcribe = False
+                with state_lock:
+                    if is_recording and not is_transcribing:
+                        is_recording = False
+                        is_transcribing = True
+                        should_transcribe = True
+                    elif is_transcribing:
+                        logging.warning("Transcription already in progress, ignoring release")
+
+                # Spawn transcription thread (will stop stream immediately)
+                if should_transcribe:
                     logging.info("Recording stopped (Command released)")
-                    is_recording = False
-                    # Stop audio stream immediately
-                    logging.debug(f"audio_stream={audio_stream}, active={audio_stream.active if audio_stream else 'N/A'}")
-                    if audio_stream and audio_stream.active:
-                        try:
-                            audio_stream.stop()
-                            logging.info("Audio stream stopped")
-                        except Exception as e:
-                            logging.error(f"Failed to stop audio stream: {e}")
-                    else:
-                        logging.warning(f"Audio stream not active, skipping stop")
-                    # Transcribe in separate thread to avoid blocking
                     threading.Thread(target=transcribe_audio, daemon=True).start()
+
+                # Consume the Right Command release event
+                return None
     except Exception as e:
         logging.error(f"Error in key_event_callback: {e}")
 
-    # Return the event unmodified
+    # Pass through other events unmodified
     return event
 
 class DictationApp(rumps.App):
     def __init__(self):
         super(DictationApp, self).__init__("🎤", quit_button=None)
+        self.app_ref = self  # Store reference for callbacks to update icon
 
         # Create model selection submenu
         self.model_menu = {
@@ -326,7 +383,7 @@ class DictationApp(rumps.App):
         global is_transcribing
 
         # Check if transcription is in progress
-        with transcription_lock:
+        with state_lock:
             if is_transcribing:
                 logging.warning("Cannot switch model while transcription is in progress")
                 rumps.notification(
@@ -416,7 +473,6 @@ if __name__ == "__main__":
     if not acquire_single_instance_lock():
         sys.exit(1)
 
-    try:
-        DictationApp().run()
-    finally:
-        release_single_instance_lock()
+    # atexit will handle cleanup automatically
+    app_instance = DictationApp()
+    app_instance.run()
