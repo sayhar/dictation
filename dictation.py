@@ -143,20 +143,32 @@ def state_manager():
 
     Handles all state transitions in one place.
     Purely event-driven - 0% CPU when blocked on queue.get()
+
+    Supports parallel chunk recording: User can press Command again
+    while previous chunks are still transcribing. Chunks always type
+    in the order they were recorded, even if transcription finishes
+    out-of-order.
     """
-    global recording_buffer  # Declare at function start
-    state = 'IDLE'  # States: IDLE, RECORDING, TRANSCRIBING
-    pending_text = None  # Text waiting for Command release
+    global recording_buffer
+
+    # Recording state
+    is_recording = False
+    current_chunk_id = None  # ID of chunk currently being recorded
 
     # Tracks whether Command is held "for recording purposes"
-    # - Set to True when starting recording (COMMAND_DOWN in IDLE)
-    # - Set to False when stopping recording or typing queued text
-    # - NOT updated for ignored Command events (e.g., during transcription)
+    # - Set to True when starting recording (COMMAND_DOWN when not is_recording)
+    # - Set to False when stopping recording or typing queued chunks
+    # - NOT updated for ignored Command events (e.g., COMMAND_DOWN during recording)
     # - Reset to False in all error handlers to prevent state corruption
     # Physical Command state is checked separately by typing protection layer
     command_held = False
 
-    logging.info("State manager started")
+    # Sequencing: ensures chunks type in order
+    next_chunk_to_record = 0  # Next chunk ID to assign when recording starts
+    next_chunk_to_type = 0     # Next chunk ID that should be typed
+    pending_chunks = {}        # {chunk_id: text} - completed chunks waiting to type
+
+    logging.info("State manager started (parallel chunk recording enabled)")
 
     while True:
         try:
@@ -164,21 +176,27 @@ def state_manager():
             # This is 0% CPU whether idle, recording, or transcribing
             msg = command_queue.get()
 
-            logging.debug(f"State manager: state={state}, msg={msg}, command_held={command_held}")
+            logging.debug(f"State manager: is_recording={is_recording}, command_held={command_held}, "
+                         f"msg={msg}, pending_chunks={list(pending_chunks.keys())}")
 
             # Handle COMMAND_DOWN
             if msg == 'COMMAND_DOWN':
-                if state == 'IDLE':
-                    # Start recording - mark Command as held
+                # Always allow recording, even if transcribing previous chunks!
+                # This enables natural chunking: press → release → press → release
+                if not is_recording:
+                    # Mark Command as held ONLY when starting recording
                     command_held = True
-                    state = 'RECORDING'
+                    is_recording = True
+                    current_chunk_id = next_chunk_to_record
+                    next_chunk_to_record += 1
+
                     with recording_lock:
                         recording_buffer = []
 
                     if audio_stream and not audio_stream.active:
                         try:
                             audio_stream.start()
-                            logging.info("Recording started")
+                            logging.info(f"Recording started (chunk {current_chunk_id})")
                             if app_instance:
                                 app_instance.title = "🎤"
                         except Exception as e:
@@ -186,25 +204,24 @@ def state_manager():
                             with recording_lock:
                                 recording_buffer = None
                             command_held = False  # Reset on error to avoid state corruption
-                            state = 'IDLE'
-
-                elif state == 'TRANSCRIBING':
-                    # User pressed Command while transcribing - ignore completely
-                    # Don't update command_held to avoid state corruption
-                    logging.debug("Command pressed during transcription - ignoring")
+                            is_recording = False
+                    else:
+                        logging.info(f"Recording new chunk {current_chunk_id} (stream already active)")
 
             # Handle COMMAND_UP
             elif msg == 'COMMAND_UP':
-                if state == 'RECORDING':
+                if is_recording:
                     # Stop recording, start transcription - clear command_held
                     command_held = False
-                    state = 'TRANSCRIBING'
+                    is_recording = False
+                    chunk_id = current_chunk_id
+                    current_chunk_id = None
 
                     # Stop audio stream and wait for it to actually stop
                     if audio_stream and audio_stream.active:
                         try:
                             audio_stream.stop()  # Blocks until stream is stopped
-                            logging.info("Recording stopped")
+                            logging.info(f"Recording stopped (chunk {chunk_id})")
                         except Exception as e:
                             logging.error(f"Failed to stop audio stream: {e}")
 
@@ -219,56 +236,68 @@ def state_manager():
                         recorded_audio = recording_buffer[:]
                         recording_buffer = None  # Stop recording
 
-                    # Update icon
+                    # Update icon to show transcribing
                     if app_instance:
                         app_instance.title = "💭"
 
                     # Spawn transcription thread
-                    def do_transcription():
+                    # IMPORTANT: Capture chunk_id in closure properly
+                    def do_transcription(cid=chunk_id, audio=recorded_audio):
                         try:
-                            result = transcribe_recorded_audio(recorded_audio)
-                            command_queue.put(('TRANSCRIPTION_DONE', result))
+                            result = transcribe_recorded_audio(audio)
+                            command_queue.put(('CHUNK_DONE', cid, result))
                         except Exception as e:
-                            logging.error(f"Transcription failed: {e}")
-                            command_queue.put(('TRANSCRIPTION_DONE', ""))
+                            logging.error(f"Transcription failed for chunk {cid}: {e}")
+                            command_queue.put(('CHUNK_DONE', cid, ""))
 
                     threading.Thread(target=do_transcription, daemon=True).start()
-                    logging.info("Transcription started")
+                    logging.info(f"Transcription started for chunk {chunk_id}")
 
-                elif pending_text:
-                    # If we have pending text, type it now and clear command_held
-                    command_held = False
-                    type_text(pending_text)
-                    pending_text = None
+                # Try to type any pending chunks that are ready (in order)
+                # Command was just released, so safe to type
+                typed_any = False
+                while next_chunk_to_type in pending_chunks:
+                    type_text(pending_chunks[next_chunk_to_type])
+                    del pending_chunks[next_chunk_to_type]
+                    next_chunk_to_type += 1
+                    typed_any = True
+
+                if typed_any:
                     if app_instance:
                         app_instance.title = "🎤"
-                    logging.info("Typed pending text after Command release")
+                    logging.info(f"Typed chunks up to {next_chunk_to_type - 1}")
 
-            # Handle TRANSCRIPTION_DONE
-            elif isinstance(msg, tuple) and msg[0] == 'TRANSCRIPTION_DONE':
-                text = msg[1]
+            # Handle CHUNK_DONE: A transcription finished
+            elif isinstance(msg, tuple) and msg[0] == 'CHUNK_DONE':
+                chunk_id, text = msg[1], msg[2]
+                pending_chunks[chunk_id] = text
+                logging.info(f"Chunk {chunk_id} transcription done (text length: {len(text)})")
 
-                if command_held:
-                    # User is still holding Command - queue the text
-                    pending_text = text
-                    if app_instance:
-                        app_instance.title = "⏸️"  # Paused icon
-                    logging.info(f"Transcription done, but Command held - text queued (length: {len(text)})")
+                # Type chunks in order if Command is not held and we're not recording
+                if not command_held and not is_recording:
+                    typed_any = False
+                    while next_chunk_to_type in pending_chunks:
+                        type_text(pending_chunks[next_chunk_to_type])
+                        del pending_chunks[next_chunk_to_type]
+                        next_chunk_to_type += 1
+                        typed_any = True
+
+                    if typed_any:
+                        if app_instance:
+                            app_instance.title = "🎤"
+                        logging.info(f"Typed chunks up to {next_chunk_to_type - 1}")
                 else:
-                    # Safe to type immediately
-                    type_text(text)
-                    if app_instance:
-                        app_instance.title = "🎤"
-                    logging.info("Transcription done, text typed")
-
-                state = 'IDLE'
+                    # Command is held or still recording - queue for later
+                    if app_instance and not is_recording:
+                        app_instance.title = "⏸️"  # Paused icon
+                    logging.info(f"Chunk {chunk_id} queued (command_held={command_held}, is_recording={is_recording})")
 
         except Exception as e:
             logging.error(f"State manager error: {e}", exc_info=True)
-            # Reset state to IDLE on errors
+            # Reset state on errors but preserve pending chunks
             command_held = False  # Reset to avoid state corruption
-            state = 'IDLE'
-            pending_text = None
+            is_recording = False
+            current_chunk_id = None
 
 def transcribe_recorded_audio(audio_chunks):
     """
