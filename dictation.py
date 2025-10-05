@@ -135,11 +135,6 @@ def audio_callback(indata, frames, time, status):
         if recording_buffer is not None:
             recording_buffer.append(indata.copy())
 
-# Thread pool executor for running transcription with timeout
-# Use max_workers=2 to allow one timeout to run while a new transcription starts
-# This prevents blocking the user if a transcription hangs
-transcription_executor = ThreadPoolExecutor(max_workers=2)
-
 def state_manager():
     """
     Main state machine - runs on dedicated thread.
