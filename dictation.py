@@ -253,19 +253,8 @@ def state_manager():
                     threading.Thread(target=do_transcription, daemon=True).start()
                     logging.info(f"Transcription started for chunk {chunk_id}")
 
-                # Try to type any pending chunks that are ready (in order)
-                # Command was just released, so safe to type
-                typed_any = False
-                while next_chunk_to_type in pending_chunks:
-                    type_text(pending_chunks[next_chunk_to_type])
-                    del pending_chunks[next_chunk_to_type]
-                    next_chunk_to_type += 1
-                    typed_any = True
-
-                if typed_any:
-                    if app_instance:
-                        app_instance.title = "🎤"
-                    logging.info(f"Typed chunks up to {next_chunk_to_type - 1}")
+                # Pending chunks will be typed by CHUNK_DONE handler when safe
+                # (checking command_held and is_recording to avoid race conditions)
 
             # Handle CHUNK_DONE: A transcription finished
             elif isinstance(msg, tuple) and msg[0] == 'CHUNK_DONE':
