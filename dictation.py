@@ -161,10 +161,9 @@ def state_manager():
 
             # Handle COMMAND_DOWN
             if msg == 'COMMAND_DOWN':
-                command_held = True
-
                 if state == 'IDLE':
-                    # Start recording
+                    # Start recording - mark Command as held
+                    command_held = True
                     state = 'RECORDING'
                     with recording_lock:
                         recording_buffer = []
@@ -182,15 +181,15 @@ def state_manager():
                             state = 'IDLE'
 
                 elif state == 'TRANSCRIBING':
-                    # User pressed Command while transcribing - ignore for now
+                    # User pressed Command while transcribing - ignore completely
+                    # Don't update command_held to avoid state corruption
                     logging.debug("Command pressed during transcription - ignoring")
 
             # Handle COMMAND_UP
             elif msg == 'COMMAND_UP':
-                command_held = False
-
                 if state == 'RECORDING':
-                    # Stop recording, start transcription
+                    # Stop recording, start transcription - clear command_held
+                    command_held = False
                     state = 'TRANSCRIBING'
 
                     # Stop audio stream and wait for it to actually stop
@@ -228,8 +227,9 @@ def state_manager():
                     threading.Thread(target=do_transcription, daemon=True).start()
                     logging.info("Transcription started")
 
-                # If we have pending text, type it now
-                if pending_text:
+                elif pending_text:
+                    # If we have pending text, type it now and clear command_held
+                    command_held = False
                     type_text(pending_text)
                     pending_text = None
                     if app_instance:
