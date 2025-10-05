@@ -99,6 +99,7 @@ os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH'
 SAMPLE_RATE = 16000
 CHANNELS = 1
 kVK_RightCommand = 0x36  # Virtual key code for Right Command
+kCGEventFlagMaskCommandLeft = 0x0008  # Left Command key bit in event flags
 TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 
 # Global state (queue-based architecture)
@@ -108,6 +109,7 @@ recording_lock = threading.Lock()  # Protects recording_buffer
 model = None
 audio_stream = None
 right_command_pressed = False
+typing_in_progress = False  # Flag to block Right Command during typing
 current_model = "small"  # Default model
 app_instance = None  # Reference to DictationApp instance for updating icon
 
@@ -145,7 +147,14 @@ def state_manager():
     global recording_buffer  # Declare at function start
     state = 'IDLE'  # States: IDLE, RECORDING, TRANSCRIBING
     pending_text = None  # Text waiting for Command release
-    command_held = False  # Is Right Command currently pressed?
+
+    # Tracks whether Command is held "for recording purposes"
+    # - Set to True when starting recording (COMMAND_DOWN in IDLE)
+    # - Set to False when stopping recording or typing queued text
+    # - NOT updated for ignored Command events (e.g., during transcription)
+    # - Reset to False in all error handlers to prevent state corruption
+    # Physical Command state is checked separately by typing protection layer
+    command_held = False
 
     logging.info("State manager started")
 
@@ -159,10 +168,9 @@ def state_manager():
 
             # Handle COMMAND_DOWN
             if msg == 'COMMAND_DOWN':
-                command_held = True
-
                 if state == 'IDLE':
-                    # Start recording
+                    # Start recording - mark Command as held
+                    command_held = True
                     state = 'RECORDING'
                     with recording_lock:
                         recording_buffer = []
@@ -177,18 +185,19 @@ def state_manager():
                             logging.error(f"Failed to start audio stream: {e}")
                             with recording_lock:
                                 recording_buffer = None
+                            command_held = False  # Reset on error to avoid state corruption
                             state = 'IDLE'
 
                 elif state == 'TRANSCRIBING':
-                    # User pressed Command while transcribing - ignore for now
+                    # User pressed Command while transcribing - ignore completely
+                    # Don't update command_held to avoid state corruption
                     logging.debug("Command pressed during transcription - ignoring")
 
             # Handle COMMAND_UP
             elif msg == 'COMMAND_UP':
-                command_held = False
-
                 if state == 'RECORDING':
-                    # Stop recording, start transcription
+                    # Stop recording, start transcription - clear command_held
+                    command_held = False
                     state = 'TRANSCRIBING'
 
                     # Stop audio stream and wait for it to actually stop
@@ -226,8 +235,9 @@ def state_manager():
                     threading.Thread(target=do_transcription, daemon=True).start()
                     logging.info("Transcription started")
 
-                # If we have pending text, type it now
-                if pending_text:
+                elif pending_text:
+                    # If we have pending text, type it now and clear command_held
+                    command_held = False
                     type_text(pending_text)
                     pending_text = None
                     if app_instance:
@@ -256,6 +266,7 @@ def state_manager():
         except Exception as e:
             logging.error(f"State manager error: {e}", exc_info=True)
             # Reset state to IDLE on errors
+            command_held = False  # Reset to avoid state corruption
             state = 'IDLE'
             pending_text = None
 
@@ -337,39 +348,82 @@ def type_text(text):
     """
     Type text using AppleScript keystroke.
 
-    CRITICAL: This should only be called when Command is NOT held.
-    The state manager ensures this by checking command_held before calling.
+    Sets typing_in_progress flag to block Right Command events during typing.
+    This prevents shortcuts (Cmd+T, Cmd+A, etc.) from triggering while text is being typed.
     """
+    global typing_in_progress
+
     if not text:
         return
 
-    # Escape for AppleScript
-    escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+    # Set flag to block Right Command events during typing
+    typing_in_progress = True
 
-    logging.info(f"Typing text: {len(text)} chars")
-    result = subprocess.run([
-        'osascript', '-e',
-        f'tell application "System Events" to keystroke "{escaped_text}"'
-    ], capture_output=True, text=True)
+    try:
+        # Escape for AppleScript
+        escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
 
-    if result.returncode != 0:
-        logging.error(f"Failed to type text: {result.stderr}")
-    else:
-        logging.info("Text typed successfully")
+        logging.info(f"Typing text: {len(text)} chars (Right Command blocked)")
+        result = subprocess.run([
+            'osascript', '-e',
+            f'tell application "System Events" to keystroke "{escaped_text}"'
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logging.error(f"Failed to type text: {result.stderr}")
+        else:
+            logging.info("Text typed successfully")
+    finally:
+        # Always clear flag, even if typing failed
+        typing_in_progress = False
+        logging.debug("Typing completed, Right Command unblocked")
 
 
 def key_event_callback(proxy, event_type, event, refcon):
-    """Callback for CGEvent tap - just posts commands to queue"""
-    global right_command_pressed
+    """Callback for CGEvent tap - posts commands to queue and blocks Right Command during typing"""
+    global right_command_pressed, typing_in_progress
 
     try:
-        from Quartz import CGEventGetFlags, kCGEventFlagMaskCommand
+        from Quartz import CGEventGetFlags, CGEventSetFlags, kCGEventFlagMaskCommand
 
+        # Two-layer defense against Command shortcuts during typing:
+        # 1. Strip flags from key events (handles Command already held BEFORE typing)
+        # 2. Block flag change events (prevents NEW Command presses during typing)
+
+        # Layer 1: Strip Command flag from key events during typing
+        if typing_in_progress and event_type in (kCGEventKeyDown, kCGEventKeyUp):
+            flags = CGEventGetFlags(event)
+            if flags & kCGEventFlagMaskCommand:
+                # Check if it's Right Command (not Left)
+                left_cmd = (flags & kCGEventFlagMaskCommandLeft) != 0
+                right_cmd = not left_cmd
+
+                if right_cmd:
+                    # Strip Command flag from the event
+                    new_flags = flags & ~kCGEventFlagMaskCommand
+                    CGEventSetFlags(event, new_flags)
+                    logging.debug("Stripped Right Command flag from key event during typing")
+                    return event  # Pass through with modified flags
+
+        # Layer 2: Block Command flag changes during typing
         if event_type == kCGEventFlagsChanged:
             flags = CGEventGetFlags(event)
             command_pressed = (flags & kCGEventFlagMaskCommand) != 0
-            left_cmd = command_pressed and (flags & 0x0008) != 0
+            left_cmd = command_pressed and (flags & kCGEventFlagMaskCommandLeft) != 0
             right_cmd = command_pressed and not left_cmd
+
+            # Block Right Command during typing
+            # Left Command is NOT blocked - provides safety valve (Cmd+Q still works)
+            if typing_in_progress:
+                if right_cmd:
+                    # Block Command press during typing
+                    logging.debug("Blocked Right Command press during typing")
+                    return None  # Consume the event
+                elif not command_pressed and right_command_pressed:
+                    # Command was released during typing - consume but update state
+                    logging.debug("Right Command released during typing (updating state)")
+                    right_command_pressed = False
+                    return None  # Consume without sending COMMAND_UP
 
             if right_cmd and not right_command_pressed:
                 right_command_pressed = True
