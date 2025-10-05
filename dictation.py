@@ -147,7 +147,14 @@ def state_manager():
     global recording_buffer  # Declare at function start
     state = 'IDLE'  # States: IDLE, RECORDING, TRANSCRIBING
     pending_text = None  # Text waiting for Command release
-    command_held = False  # Is Right Command currently pressed?
+
+    # Tracks whether Command is held "for recording purposes"
+    # - Set to True when starting recording (COMMAND_DOWN in IDLE)
+    # - Set to False when stopping recording or typing queued text
+    # - NOT updated for ignored Command events (e.g., during transcription)
+    # - Reset to False in all error handlers to prevent state corruption
+    # Physical Command state is checked separately by typing protection layer
+    command_held = False
 
     logging.info("State manager started")
 
@@ -178,6 +185,7 @@ def state_manager():
                             logging.error(f"Failed to start audio stream: {e}")
                             with recording_lock:
                                 recording_buffer = None
+                            command_held = False  # Reset on error to avoid state corruption
                             state = 'IDLE'
 
                 elif state == 'TRANSCRIBING':
@@ -258,6 +266,7 @@ def state_manager():
         except Exception as e:
             logging.error(f"State manager error: {e}", exc_info=True)
             # Reset state to IDLE on errors
+            command_held = False  # Reset to avoid state corruption
             state = 'IDLE'
             pending_text = None
 
