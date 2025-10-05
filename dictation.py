@@ -374,7 +374,22 @@ def key_event_callback(proxy, event_type, event, refcon):
     global right_command_pressed, typing_in_progress
 
     try:
-        from Quartz import CGEventGetFlags, kCGEventFlagMaskCommand
+        from Quartz import CGEventGetFlags, CGEventSetFlags, kCGEventFlagMaskCommand
+
+        # During typing, strip Command flag from ALL events to prevent shortcuts
+        if typing_in_progress and event_type in (kCGEventKeyDown, kCGEventKeyUp):
+            flags = CGEventGetFlags(event)
+            if flags & kCGEventFlagMaskCommand:
+                # Check if it's Right Command (not Left)
+                left_cmd = (flags & 0x0008) != 0
+                right_cmd = not left_cmd
+
+                if right_cmd:
+                    # Strip Command flag from the event
+                    new_flags = flags & ~kCGEventFlagMaskCommand
+                    CGEventSetFlags(event, new_flags)
+                    logging.debug("Stripped Right Command flag from key event during typing")
+                    return event  # Pass through with modified flags
 
         if event_type == kCGEventFlagsChanged:
             flags = CGEventGetFlags(event)
@@ -382,12 +397,15 @@ def key_event_callback(proxy, event_type, event, refcon):
             left_cmd = command_pressed and (flags & 0x0008) != 0
             right_cmd = command_pressed and not left_cmd
 
-            # Block Right Command events while typing is in progress
+            # Block Right Command during typing (both press AND release)
             # This prevents Cmd+T, Cmd+A, etc. shortcuts during text insertion
+            # and prevents Command key state from getting out of sync
             # Left Command is NOT blocked - provides safety valve (Cmd+Q still works)
-            if typing_in_progress and right_cmd:
-                logging.debug("Blocked Right Command event during typing")
-                return None  # Consume the event
+            if typing_in_progress:
+                if right_cmd or (not command_pressed and right_command_pressed):
+                    # Block Right Command press OR release of Right Command during typing
+                    logging.debug("Blocked Right Command during typing")
+                    return None  # Consume the event
 
             if right_cmd and not right_command_pressed:
                 right_command_pressed = True
