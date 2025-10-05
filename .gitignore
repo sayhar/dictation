@@ -25,3 +25,7 @@ icon.png
 
 # Temporary
 *.wav
+
+# Planning docs (not for version control)
+next.md
+CLAUDE.md
