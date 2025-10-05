@@ -99,6 +99,7 @@ os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH'
 SAMPLE_RATE = 16000
 CHANNELS = 1
 kVK_RightCommand = 0x36  # Virtual key code for Right Command
+kCGEventFlagMaskCommandLeft = 0x0008  # Left Command key bit in event flags
 TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 
 # Global state (queue-based architecture)
@@ -376,12 +377,16 @@ def key_event_callback(proxy, event_type, event, refcon):
     try:
         from Quartz import CGEventGetFlags, CGEventSetFlags, kCGEventFlagMaskCommand
 
-        # During typing, strip Command flag from ALL events to prevent shortcuts
+        # Two-layer defense against Command shortcuts during typing:
+        # 1. Strip flags from key events (handles Command already held BEFORE typing)
+        # 2. Block flag change events (prevents NEW Command presses during typing)
+
+        # Layer 1: Strip Command flag from key events during typing
         if typing_in_progress and event_type in (kCGEventKeyDown, kCGEventKeyUp):
             flags = CGEventGetFlags(event)
             if flags & kCGEventFlagMaskCommand:
                 # Check if it's Right Command (not Left)
-                left_cmd = (flags & 0x0008) != 0
+                left_cmd = (flags & kCGEventFlagMaskCommandLeft) != 0
                 right_cmd = not left_cmd
 
                 if right_cmd:
@@ -391,21 +396,25 @@ def key_event_callback(proxy, event_type, event, refcon):
                     logging.debug("Stripped Right Command flag from key event during typing")
                     return event  # Pass through with modified flags
 
+        # Layer 2: Block Command flag changes during typing
         if event_type == kCGEventFlagsChanged:
             flags = CGEventGetFlags(event)
             command_pressed = (flags & kCGEventFlagMaskCommand) != 0
-            left_cmd = command_pressed and (flags & 0x0008) != 0
+            left_cmd = command_pressed and (flags & kCGEventFlagMaskCommandLeft) != 0
             right_cmd = command_pressed and not left_cmd
 
-            # Block Right Command during typing (both press AND release)
-            # This prevents Cmd+T, Cmd+A, etc. shortcuts during text insertion
-            # and prevents Command key state from getting out of sync
+            # Block Right Command during typing
             # Left Command is NOT blocked - provides safety valve (Cmd+Q still works)
             if typing_in_progress:
-                if right_cmd or (not command_pressed and right_command_pressed):
-                    # Block Right Command press OR release of Right Command during typing
-                    logging.debug("Blocked Right Command during typing")
+                if right_cmd:
+                    # Block Command press during typing
+                    logging.debug("Blocked Right Command press during typing")
                     return None  # Consume the event
+                elif not command_pressed and right_command_pressed:
+                    # Command was released during typing - consume but update state
+                    logging.debug("Right Command released during typing (updating state)")
+                    right_command_pressed = False
+                    return None  # Consume without sending COMMAND_UP
 
             if right_cmd and not right_command_pressed:
                 right_command_pressed = True
