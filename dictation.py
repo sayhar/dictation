@@ -18,6 +18,7 @@ import logging
 import sys
 import fcntl
 import atexit
+import datetime
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from Quartz import (
     CGEventMaskBit,
@@ -162,7 +163,7 @@ def transcribe_audio():
                 logging.info("Audio stream stopped")
             except Exception as e:
                 logging.error(f"Failed to stop audio stream: {e}")
-                return
+                # Continue with transcription - audio already captured
 
         # Copy audio data and clear for next recording (use audio_lock)
         with audio_lock:
@@ -213,7 +214,6 @@ def transcribe_audio():
             # Log long transcriptions (>60 seconds) to a separate file
             if duration_seconds > 60 and text:
                 transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
-                import datetime
                 timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 with open(transcript_log, 'a') as f:
                     f.write(f"\n{'='*80}\n")
@@ -244,8 +244,12 @@ def transcribe_audio():
                 subtitle="Transcription timed out",
                 message=f"Audio took too long to transcribe. Try a smaller/faster model."
             )
-            # Attempt to cancel - won't work if already running, but prevents queueing
-            # The thread will continue running in the background until Whisper completes
+            # KNOWN LIMITATION: Thread leak on timeout
+            # future.cancel() only works if the task hasn't started executing yet.
+            # Once Whisper is running, the thread continues until completion (potentially 10+ min).
+            # This can accumulate zombie threads if multiple timeouts occur.
+            # Solution: Use ProcessPoolExecutor for true process termination (planned refactor).
+            # For now: max_workers=2 prevents blocking, leaked threads eventually complete.
             was_cancelled = future.cancel()
             if not was_cancelled:
                 logging.warning("Could not cancel running transcription thread - it will complete in background")
@@ -344,7 +348,6 @@ def key_event_callback(proxy, event_type, event, refcon):
 class DictationApp(rumps.App):
     def __init__(self):
         super(DictationApp, self).__init__("🎤", quit_button=None)
-        self.app_ref = self  # Store reference for callbacks to update icon
 
         # Create model selection submenu
         self.model_menu = {
