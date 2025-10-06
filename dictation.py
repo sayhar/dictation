@@ -20,6 +20,7 @@ import fcntl
 import atexit
 import datetime
 import queue
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from Quartz import (
     CGEventMaskBit,
@@ -191,6 +192,38 @@ def state_manager():
     next_chunk_to_type = 0     # Next chunk ID that should be typed
     pending_chunks = {}        # {chunk_id: text} - completed chunks waiting to type
 
+    def try_type_pending_chunks():
+        """
+        Try to type chunks in order. Returns True if any progress was made.
+        Stops on first timeout (keeps remaining chunks queued).
+        """
+        nonlocal next_chunk_to_type
+        made_progress = False
+
+        while next_chunk_to_type in pending_chunks:
+            chunk_text = pending_chunks[next_chunk_to_type]
+
+            if chunk_text:
+                success = type_text(chunk_text)
+                if success:
+                    # Typed successfully, remove from queue
+                    made_progress = True
+                    del pending_chunks[next_chunk_to_type]
+                    next_chunk_to_type += 1
+                else:
+                    # Timeout - Command still held, stop trying
+                    logging.info(f"Typing deferred at chunk {next_chunk_to_type} - will retry later")
+                    if app_instance:
+                        app_instance.title = "⏸️"
+                    break
+            else:
+                # Empty chunk - skip and advance (this IS progress!)
+                made_progress = True
+                del pending_chunks[next_chunk_to_type]
+                next_chunk_to_type += 1
+
+        return made_progress
+
     logging.info("State manager started (parallel chunk recording enabled)")
 
     while True:
@@ -198,9 +231,7 @@ def state_manager():
             # ALWAYS BLOCK - no timeouts, no polling!
             # This is 0% CPU whether idle, recording, or transcribing
             msg = command_queue.get()
-
-            logging.debug(f"State manager: is_recording={is_recording}, msg={msg}, "
-                         f"pending_chunks={list(pending_chunks.keys())}")
+            logging.debug(f"State manager received: {msg}")
 
             # Handle COMMAND_DOWN
             if msg == 'COMMAND_DOWN':
@@ -226,7 +257,8 @@ def state_manager():
                                 recording_buffer = None
                             is_recording = False
                     else:
-                        logging.info(f"Recording new chunk {current_chunk_id} (stream already active)")
+                        # This shouldn't happen - stream should be inactive when starting new recording
+                        logging.warning(f"Recording new chunk {current_chunk_id} but stream already active - unexpected state")
 
             # Handle COMMAND_UP
             elif msg == 'COMMAND_UP':
@@ -247,7 +279,6 @@ def state_manager():
                     # Wait for any in-flight callbacks to complete
                     # The callback might have been scheduled before stop() was called
                     # 50ms = 5 callback cycles at 100/sec - very safe
-                    import time
                     time.sleep(0.05)
 
                     # Now grab the recorded audio
@@ -275,26 +306,7 @@ def state_manager():
                 elif pending_chunks and not is_recording:
                     # User released Command and we have pending chunks - retry typing them
                     logging.debug("COMMAND_UP with pending chunks - attempting to type")
-                    typed_any = False
-                    while next_chunk_to_type in pending_chunks:
-                        chunk_text = pending_chunks[next_chunk_to_type]
-
-                        if chunk_text:
-                            success = type_text(chunk_text)
-                            if success:
-                                typed_any = True
-                                del pending_chunks[next_chunk_to_type]
-                                next_chunk_to_type += 1
-                            else:
-                                # Still can't type (Command held again?) - stop trying
-                                logging.debug(f"Still can't type chunk {next_chunk_to_type}")
-                                break
-                        else:
-                            # Empty chunk - advance
-                            del pending_chunks[next_chunk_to_type]
-                            next_chunk_to_type += 1
-
-                    if typed_any:
+                    if try_type_pending_chunks():
                         if app_instance:
                             app_instance.title = "🎤"
                         logging.info(f"Typed pending chunks up to {next_chunk_to_type - 1}")
@@ -310,30 +322,7 @@ def state_manager():
                 # Type chunks in order if NOT actively recording
                 # This is state-based (deterministic), not racy physical check
                 if not is_recording:
-                    typed_any = False
-                    while next_chunk_to_type in pending_chunks:
-                        chunk_text = pending_chunks[next_chunk_to_type]
-
-                        # Try to type chunk (skip empty ones)
-                        if chunk_text:
-                            success = type_text(chunk_text)
-                            if success:
-                                # Typed successfully, remove from queue
-                                typed_any = True
-                                del pending_chunks[next_chunk_to_type]
-                                next_chunk_to_type += 1
-                            else:
-                                # Timeout (Command still held) - stop trying, keep chunks queued
-                                logging.info(f"Typing deferred at chunk {next_chunk_to_type} - will retry later")
-                                if app_instance:
-                                    app_instance.title = "⏸️"  # Paused icon
-                                break  # Stop processing, chunks stay in pending_chunks
-                        else:
-                            # Empty chunk - advance without typing
-                            del pending_chunks[next_chunk_to_type]
-                            next_chunk_to_type += 1
-
-                    if typed_any:
+                    if try_type_pending_chunks():
                         if app_instance:
                             app_instance.title = "🎤"
                         logging.info(f"Typed chunks up to {next_chunk_to_type - 1}")
@@ -436,13 +425,19 @@ def type_text(text):
         False if Command still held after timeout (text should stay queued)
     """
     global typing_in_progress
-    import time
 
     if not text:
         return True  # Empty text = success
 
     # Poll-wait for Command to be released
-    # This prevents AppleScript from reading hardware Command state and firing shortcuts
+    # This reduces (but doesn't eliminate) the race window for shortcuts.
+    #
+    # KNOWN LIMITATION (TOCTOU race):
+    # - We check Command state, then start AppleScript subprocess
+    # - AppleScript takes ~10-50ms to start and execute
+    # - User can press Command during that window → shortcuts may fire
+    # - Race window: ~20ms (much better than no check, but not atomic)
+    # - Long-term fix: Migrate to CGEvents typing (no subprocess, atomic)
     max_wait_iterations = 20  # 200ms max wait (20 * 10ms)
     for i in range(max_wait_iterations):
         if not is_command_physically_held():
