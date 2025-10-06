@@ -20,6 +20,7 @@ import fcntl
 import atexit
 import datetime
 import queue
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from Quartz import (
     CGEventMaskBit,
@@ -117,6 +118,37 @@ app_instance = None  # Reference to DictationApp instance for updating icon
 # Use max_workers=2 to allow one timeout to run while a new transcription starts
 transcription_executor = ThreadPoolExecutor(max_workers=2)
 
+def is_command_physically_held():
+    """
+    Check if Right Command key is physically pressed RIGHT NOW.
+
+    This queries the actual hardware state from the HID system, not our event queue.
+    Returns True if Right Command is currently held, False otherwise.
+    """
+    try:
+        from Quartz import CGEventSourceFlagsState, kCGEventSourceStateHIDSystemState, kCGEventFlagMaskCommand
+
+        # Get current modifier flags from HID system
+        flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState)
+
+        # Check if any Command key is pressed
+        if not (flags & kCGEventFlagMaskCommand):
+            return False
+
+        # Check if it's Right Command (not Left)
+        # If Left Command flag is NOT set, then it must be Right Command
+        try:
+            from Quartz import kCGEventFlagMaskCommandLeft
+            left_cmd = (flags & kCGEventFlagMaskCommandLeft) != 0
+            return not left_cmd  # True if Right Command is pressed
+        except ImportError:
+            # Fallback if we can't distinguish - assume it's Right Command
+            return True
+
+    except Exception as e:
+        logging.error(f"Error checking physical Command state: {e}")
+        return False  # Assume not held on error
+
 def load_model(model_name=None):
     """Load Whisper model"""
     global model, current_model
@@ -143,75 +175,110 @@ def state_manager():
 
     Handles all state transitions in one place.
     Purely event-driven - 0% CPU when blocked on queue.get()
+
+    Supports parallel chunk recording: User can press Command again
+    while previous chunks are still transcribing. Chunks always type
+    in the order they were recorded, even if transcription finishes
+    out-of-order.
     """
-    global recording_buffer  # Declare at function start
-    state = 'IDLE'  # States: IDLE, RECORDING, TRANSCRIBING
-    pending_text = None  # Text waiting for Command release
+    global recording_buffer
 
-    # Tracks whether Command is held "for recording purposes"
-    # - Set to True when starting recording (COMMAND_DOWN in IDLE)
-    # - Set to False when stopping recording or typing queued text
-    # - NOT updated for ignored Command events (e.g., during transcription)
-    # - Reset to False in all error handlers to prevent state corruption
-    # Physical Command state is checked separately by typing protection layer
-    command_held = False
+    # Recording state - track with simple flag, not complex state machine
+    is_recording = False
+    current_chunk_id = None  # ID of chunk currently being recorded
 
-    logging.info("State manager started")
+    # Sequencing: ensures chunks type in order
+    next_chunk_to_record = 0  # Next chunk ID to assign when recording starts
+    next_chunk_to_type = 0     # Next chunk ID that should be typed
+    pending_chunks = {}        # {chunk_id: text} - completed chunks waiting to type
+
+    def try_type_pending_chunks():
+        """
+        Try to type chunks in order. Returns True if any progress was made.
+        Stops on first timeout (keeps remaining chunks queued).
+        """
+        nonlocal next_chunk_to_type
+        made_progress = False
+
+        while next_chunk_to_type in pending_chunks:
+            chunk_text = pending_chunks[next_chunk_to_type]
+
+            if chunk_text:
+                success = type_text(chunk_text)
+                if success:
+                    # Typed successfully, remove from queue
+                    made_progress = True
+                    del pending_chunks[next_chunk_to_type]
+                    next_chunk_to_type += 1
+                else:
+                    # Timeout - Command still held, stop trying
+                    logging.info(f"Typing deferred at chunk {next_chunk_to_type} - will retry later")
+                    if app_instance:
+                        app_instance.title = "⏸️"
+                    break
+            else:
+                # Empty chunk - skip and advance (this IS progress!)
+                made_progress = True
+                del pending_chunks[next_chunk_to_type]
+                next_chunk_to_type += 1
+
+        return made_progress
+
+    logging.info("State manager started (parallel chunk recording enabled)")
 
     while True:
         try:
             # ALWAYS BLOCK - no timeouts, no polling!
             # This is 0% CPU whether idle, recording, or transcribing
             msg = command_queue.get()
-
-            logging.debug(f"State manager: state={state}, msg={msg}, command_held={command_held}")
+            logging.debug(f"State manager received: {msg}")
 
             # Handle COMMAND_DOWN
             if msg == 'COMMAND_DOWN':
-                if state == 'IDLE':
-                    # Start recording - mark Command as held
-                    command_held = True
-                    state = 'RECORDING'
+                # Always allow recording, even if transcribing previous chunks!
+                # This enables natural chunking: press → release → press → release
+                if not is_recording:
+                    is_recording = True
+                    current_chunk_id = next_chunk_to_record
+                    next_chunk_to_record += 1
+
                     with recording_lock:
                         recording_buffer = []
 
                     if audio_stream and not audio_stream.active:
                         try:
                             audio_stream.start()
-                            logging.info("Recording started")
+                            logging.info(f"Recording started (chunk {current_chunk_id})")
                             if app_instance:
                                 app_instance.title = "🎤"
                         except Exception as e:
                             logging.error(f"Failed to start audio stream: {e}")
                             with recording_lock:
                                 recording_buffer = None
-                            command_held = False  # Reset on error to avoid state corruption
-                            state = 'IDLE'
-
-                elif state == 'TRANSCRIBING':
-                    # User pressed Command while transcribing - ignore completely
-                    # Don't update command_held to avoid state corruption
-                    logging.debug("Command pressed during transcription - ignoring")
+                            is_recording = False
+                    else:
+                        # This shouldn't happen - stream should be inactive when starting new recording
+                        logging.warning(f"Recording new chunk {current_chunk_id} but stream already active - unexpected state")
 
             # Handle COMMAND_UP
             elif msg == 'COMMAND_UP':
-                if state == 'RECORDING':
-                    # Stop recording, start transcription - clear command_held
-                    command_held = False
-                    state = 'TRANSCRIBING'
+                if is_recording:
+                    # Stop recording, start transcription
+                    is_recording = False
+                    chunk_id = current_chunk_id
+                    current_chunk_id = None
 
                     # Stop audio stream and wait for it to actually stop
                     if audio_stream and audio_stream.active:
                         try:
                             audio_stream.stop()  # Blocks until stream is stopped
-                            logging.info("Recording stopped")
+                            logging.info(f"Recording stopped (chunk {chunk_id})")
                         except Exception as e:
                             logging.error(f"Failed to stop audio stream: {e}")
 
                     # Wait for any in-flight callbacks to complete
                     # The callback might have been scheduled before stop() was called
                     # 50ms = 5 callback cycles at 100/sec - very safe
-                    import time
                     time.sleep(0.05)
 
                     # Now grab the recorded audio
@@ -219,56 +286,58 @@ def state_manager():
                         recorded_audio = recording_buffer[:]
                         recording_buffer = None  # Stop recording
 
-                    # Update icon
+                    # Update icon to show transcribing
                     if app_instance:
                         app_instance.title = "💭"
 
                     # Spawn transcription thread
-                    def do_transcription():
+                    # IMPORTANT: Capture chunk_id in closure properly
+                    def do_transcription(cid=chunk_id, audio=recorded_audio):
                         try:
-                            result = transcribe_recorded_audio(recorded_audio)
-                            command_queue.put(('TRANSCRIPTION_DONE', result))
+                            result = transcribe_recorded_audio(audio)
+                            command_queue.put(('CHUNK_DONE', cid, result))
                         except Exception as e:
-                            logging.error(f"Transcription failed: {e}")
-                            command_queue.put(('TRANSCRIPTION_DONE', ""))
+                            logging.error(f"Transcription failed for chunk {cid}: {e}")
+                            command_queue.put(('CHUNK_DONE', cid, ""))
 
                     threading.Thread(target=do_transcription, daemon=True).start()
-                    logging.info("Transcription started")
+                    logging.info(f"Transcription started for chunk {chunk_id}")
 
-                elif pending_text:
-                    # If we have pending text, type it now and clear command_held
-                    command_held = False
-                    type_text(pending_text)
-                    pending_text = None
-                    if app_instance:
-                        app_instance.title = "🎤"
-                    logging.info("Typed pending text after Command release")
+                elif pending_chunks and not is_recording:
+                    # User released Command and we have pending chunks - retry typing them
+                    logging.debug("COMMAND_UP with pending chunks - attempting to type")
+                    if try_type_pending_chunks():
+                        if app_instance:
+                            app_instance.title = "🎤"
+                        logging.info(f"Typed pending chunks up to {next_chunk_to_type - 1}")
 
-            # Handle TRANSCRIPTION_DONE
-            elif isinstance(msg, tuple) and msg[0] == 'TRANSCRIPTION_DONE':
-                text = msg[1]
+            # Handle CHUNK_DONE: A transcription finished
+            elif isinstance(msg, tuple) and msg[0] == 'CHUNK_DONE':
+                chunk_id, text = msg[1], msg[2]
 
-                if command_held:
-                    # User is still holding Command - queue the text
-                    pending_text = text
+                # Store chunk (even if empty - needed for sequencing)
+                pending_chunks[chunk_id] = text
+                logging.info(f"Chunk {chunk_id} transcription done (text length: {len(text)})")
+
+                # Type chunks in order if NOT actively recording
+                # This is state-based (deterministic), not racy physical check
+                if not is_recording:
+                    if try_type_pending_chunks():
+                        if app_instance:
+                            app_instance.title = "🎤"
+                        logging.info(f"Typed chunks up to {next_chunk_to_type - 1}")
+                else:
+                    # Currently recording - defer typing to avoid interruption
+                    # Chunks will be typed when recording stops
                     if app_instance:
                         app_instance.title = "⏸️"  # Paused icon
-                    logging.info(f"Transcription done, but Command held - text queued (length: {len(text)})")
-                else:
-                    # Safe to type immediately
-                    type_text(text)
-                    if app_instance:
-                        app_instance.title = "🎤"
-                    logging.info("Transcription done, text typed")
-
-                state = 'IDLE'
+                    logging.info(f"Chunk {chunk_id} queued (is_recording={is_recording})")
 
         except Exception as e:
             logging.error(f"State manager error: {e}", exc_info=True)
-            # Reset state to IDLE on errors
-            command_held = False  # Reset to avoid state corruption
-            state = 'IDLE'
-            pending_text = None
+            # Reset recording state on errors but preserve pending chunks
+            is_recording = False
+            current_chunk_id = None
 
 def transcribe_recorded_audio(audio_chunks):
     """
@@ -348,15 +417,40 @@ def type_text(text):
     """
     Type text using AppleScript keystroke.
 
+    Waits for Command to be released before typing to prevent shortcuts.
     Sets typing_in_progress flag to block Right Command events during typing.
-    This prevents shortcuts (Cmd+T, Cmd+A, etc.) from triggering while text is being typed.
+
+    Returns:
+        True if text was typed successfully
+        False if Command still held after timeout (text should stay queued)
     """
     global typing_in_progress
 
     if not text:
-        return
+        return True  # Empty text = success
 
-    # Set flag to block Right Command events during typing
+    # Poll-wait for Command to be released
+    # This reduces (but doesn't eliminate) the race window for shortcuts.
+    #
+    # KNOWN LIMITATION (TOCTOU race):
+    # - We check Command state, then start AppleScript subprocess
+    # - AppleScript takes ~10-50ms to start and execute
+    # - User can press Command during that window → shortcuts may fire
+    # - Race window: ~20ms (much better than no check, but not atomic)
+    # - Long-term fix: Migrate to CGEvents typing (no subprocess, atomic)
+    max_wait_iterations = 20  # 200ms max wait (20 * 10ms)
+    for i in range(max_wait_iterations):
+        if not is_command_physically_held():
+            break  # Command released, safe to type
+        time.sleep(0.01)  # Wait 10ms
+        if i == 0:
+            logging.debug("Waiting for Command to be released before typing...")
+    else:
+        # Loop completed without break = timeout, Command still held
+        logging.warning(f"Timeout waiting for Command release after {max_wait_iterations * 10}ms - deferring text")
+        return False  # Don't type, keep text queued
+
+    # Command was released, safe to type now
     typing_in_progress = True
 
     try:
@@ -371,8 +465,10 @@ def type_text(text):
 
         if result.returncode != 0:
             logging.error(f"Failed to type text: {result.stderr}")
+            return False
         else:
             logging.info("Text typed successfully")
+            return True
     finally:
         # Always clear flag, even if typing failed
         typing_in_progress = False
