@@ -129,7 +129,7 @@ tail -f ~/Library/Logs/Dictation.log
 
 ## Performance Tests
 
-### Long Recording (>60 seconds)
+### Long Recording (>30 seconds)
 **Test:**
 1. Hold Right Command and speak continuously for 90 seconds
 2. Release and wait for transcription
