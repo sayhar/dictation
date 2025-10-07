@@ -21,6 +21,7 @@ import atexit
 import datetime
 import queue
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from Quartz import (
     CGEventMaskBit,
@@ -48,6 +49,7 @@ logging.basicConfig(
 
 # Single instance lock - ensure only one app instance runs at a time
 LOCK_FILE = os.path.expanduser('~/Library/Application Support/Dictation.lock')
+PREFERENCES_FILE = os.path.expanduser('~/Library/Application Support/Dictation/preferences.json')
 lock_file_handle = None
 
 def acquire_single_instance_lock():
@@ -93,6 +95,69 @@ def release_single_instance_lock():
         except Exception as e:
             logging.warning(f"Failed to release lock: {e}")
 
+def validate_model(model_name):
+    """
+    Validate model name against VALID_MODELS list.
+
+    Returns:
+        str: The validated model name, or 'small' if invalid
+    """
+    return model_name if model_name in VALID_MODELS else "small"
+
+def load_preferences():
+    """Load preferences from JSON file, return defaults if missing/corrupt"""
+    defaults = {"model": "small"}
+
+    try:
+        if not os.path.exists(PREFERENCES_FILE):
+            logging.info("No preferences file found, using defaults")
+            return defaults
+
+        with open(PREFERENCES_FILE, 'r') as f:
+            prefs = json.load(f)
+
+        # Validate model name
+        if "model" in prefs:
+            prefs["model"] = validate_model(prefs["model"])
+        else:
+            prefs["model"] = defaults["model"]
+
+        logging.info(f"Loaded preferences: {prefs}")
+        return prefs
+
+    except (json.JSONDecodeError, IOError) as e:
+        logging.warning(f"Failed to load preferences: {e}, using defaults")
+        return defaults
+
+def save_preferences(prefs_dict):
+    """
+    Save preferences atomically to avoid corruption.
+
+    Uses atomic file operations: write to temp file, then rename.
+    This prevents corruption if the app crashes during save.
+    """
+    temp_file = None
+    try:
+        # Create directory if needed
+        os.makedirs(os.path.dirname(PREFERENCES_FILE), exist_ok=True)
+
+        # Write to temp file first, then rename (atomic on macOS)
+        temp_file = PREFERENCES_FILE + '.tmp'
+        with open(temp_file, 'w') as f:
+            json.dump(prefs_dict, f, indent=2)
+
+        os.rename(temp_file, PREFERENCES_FILE)  # Atomic operation
+        logging.info(f"Saved preferences: {prefs_dict}")
+
+    except Exception as e:
+        logging.error(f"Failed to save preferences: {e}")
+        # Clean up temp file if it exists
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+
 # Set ffmpeg path for bundled app (do this once at startup)
 os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH', '')
 
@@ -103,6 +168,7 @@ kVK_RightCommand = 0x36  # Virtual key code for Right Command
 kCGEventFlagMaskCommandLeft = 0x0008  # Left Command key bit in event flags
 TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 TRANSCRIPT_LOG_THRESHOLD = 30  # seconds - log transcriptions longer than this
+VALID_MODELS = ["tiny", "base", "small", "medium", "large"]  # Available Whisper models
 
 # Global state (queue-based architecture)
 command_queue = queue.Queue()  # Commands from event tap
@@ -541,6 +607,14 @@ class DictationApp(rumps.App):
     def __init__(self):
         super(DictationApp, self).__init__("🎤", quit_button=None)
 
+        # Load saved preferences
+        prefs = load_preferences()
+        saved_model = prefs.get("model", "small")
+
+        # Update global current_model with saved preference
+        global current_model
+        current_model = saved_model
+
         # Create model selection submenu
         self.model_menu = {
             "tiny": rumps.MenuItem("Tiny (fastest, lowest accuracy)", callback=self.change_model),
@@ -550,8 +624,12 @@ class DictationApp(rumps.App):
             "large": rumps.MenuItem("Large (slowest, best)", callback=self.change_model),
         }
 
-        # Mark current model
-        self.model_menu["small"].state = True
+        # Mark saved model as selected
+        if saved_model in self.model_menu:
+            self.model_menu[saved_model].state = True
+        else:
+            # Fallback to small if invalid
+            self.model_menu["small"].state = True
 
         self.menu = [
             rumps.MenuItem("Status: Loading...", callback=None),
@@ -591,6 +669,9 @@ class DictationApp(rumps.App):
         model_name = sender.title.split()[0].lower()
 
         logging.info(f"Switching to {model_name} model...")
+
+        # Save preference
+        save_preferences({"model": model_name})
 
         # Reload model in background
         def reload():
