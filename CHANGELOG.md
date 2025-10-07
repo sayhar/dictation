@@ -11,7 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Transcription timeout** - Dynamic timeout (2x audio duration or 120s minimum) prevents infinite hangs on corrupted/problematic audio
 - **Icon feedback** - Menu bar icon changes to 💭 (thinking) during transcription, 🎤 when ready
 - **Event consumption** - Right Command key events are consumed, preventing accidental system shortcuts during dictation
-- **Long transcript logging** - Transcriptions >60 seconds are automatically saved to `~/Library/Logs/Dictation_Transcripts.log`
+- **Long transcript logging** - Transcriptions >30 seconds are automatically saved to `~/Library/Logs/Dictation_Transcripts.log`
+- **Transcript log menu item** - "Open Transcription Log" menu item provides one-click access to saved long dictations
 
 ### Changed
 - **Stream abort instead of stop** - Uses `abort()` instead of `stop()` to avoid waiting for pending buffers (eliminates deadlock)

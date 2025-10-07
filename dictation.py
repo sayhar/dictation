@@ -102,6 +102,7 @@ CHANNELS = 1
 kVK_RightCommand = 0x36  # Virtual key code for Right Command
 kCGEventFlagMaskCommandLeft = 0x0008  # Left Command key bit in event flags
 TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
+TRANSCRIPT_LOG_THRESHOLD = 30  # seconds - log transcriptions longer than this
 
 # Global state (queue-based architecture)
 command_queue = queue.Queue()  # Commands from event tap
@@ -382,7 +383,7 @@ def transcribe_recorded_audio(audio_chunks):
                 logging.info(f"Transcribed: '{text}'")
 
                 # Log long transcriptions
-                if duration_seconds > 60 and text:
+                if duration_seconds > TRANSCRIPT_LOG_THRESHOLD and text:
                     transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
                     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     with open(transcript_log, 'a') as f:
@@ -559,6 +560,8 @@ class DictationApp(rumps.App):
             None,
             ["Model", list(self.model_menu.values())],
             None,
+            rumps.MenuItem("Open Transcription Log", callback=self.open_transcript_log),
+            None,
             "Quit"
         ]
 
@@ -595,6 +598,27 @@ class DictationApp(rumps.App):
             logging.info(f"Switched to {model_name} model")
 
         threading.Thread(target=reload, daemon=True).start()
+
+    def open_transcript_log(self, _):
+        """Open the transcription log file in default text editor"""
+        transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
+
+        # Create empty file if it doesn't exist
+        if not os.path.exists(transcript_log):
+            with open(transcript_log, 'w') as f:
+                f.write(f"# Dictation Transcripts\n# Transcriptions longer than {TRANSCRIPT_LOG_THRESHOLD}s are logged here\n\n")
+
+        # Open in default editor
+        result = subprocess.run(['open', transcript_log], capture_output=True, text=True)
+        if result.returncode != 0:
+            logging.error(f"Failed to open transcript log: {result.stderr}")
+            rumps.notification(
+                title="Dictation",
+                subtitle="Error opening log",
+                message="Could not open transcript log file"
+            )
+        else:
+            logging.info("Opened transcription log")
 
     def setup_event_tap(self):
         """Setup event tap on main thread (required for run loop)"""
