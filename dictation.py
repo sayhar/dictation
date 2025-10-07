@@ -168,6 +168,7 @@ kVK_RightCommand = 0x36  # Virtual key code for Right Command
 kCGEventFlagMaskCommandLeft = 0x0008  # Left Command key bit in event flags
 TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 TRANSCRIPT_LOG_THRESHOLD = 30  # seconds - log transcriptions longer than this
+MAX_TRANSCRIPTION_RETRIES = 2  # number of retries for failed transcriptions
 VALID_MODELS = ["tiny", "base", "small", "medium", "large"]  # Available Whisper models
 
 # Global state (queue-based architecture)
@@ -439,35 +440,60 @@ def transcribe_recorded_audio(audio_chunks):
             # Calculate timeout
             timeout_seconds = max(TRANSCRIPTION_TIMEOUT, int(duration_seconds * 2))
 
-            # Transcribe with timeout
+            # Transcribe with timeout and retry logic
             logging.info(f"Starting transcription (audio: {duration_seconds:.1f}s, timeout: {timeout_seconds}s)")
-            future = transcription_executor.submit(lambda: model.transcribe(temp_path, language="en"))
 
-            try:
-                result = future.result(timeout=timeout_seconds)
-                text = result["text"].strip()
-                logging.info(f"Transcribed: '{text}'")
+            # Retry loop wraps only model.transcribe() call
+            for attempt in range(MAX_TRANSCRIPTION_RETRIES + 1):
+                try:
+                    future = transcription_executor.submit(lambda: model.transcribe(temp_path, language="en"))
+                    result = future.result(timeout=timeout_seconds)
+                    text = result["text"].strip()
 
-                # Log long transcriptions
-                if duration_seconds > TRANSCRIPT_LOG_THRESHOLD and text:
-                    transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
-                    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    with open(transcript_log, 'a') as f:
-                        f.write(f"\n{'='*80}\n")
-                        f.write(f"[{timestamp}] Duration: {duration_seconds:.1f}s\n")
-                        f.write(f"{text}\n")
+                    if attempt > 0:
+                        logging.info(f"Transcription succeeded on retry {attempt}")
+                    logging.info(f"Transcribed: '{text}'")
 
-                return text
+                    # Log long transcriptions
+                    if duration_seconds > TRANSCRIPT_LOG_THRESHOLD and text:
+                        transcript_log = os.path.expanduser('~/Library/Logs/Dictation_Transcripts.log')
+                        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        with open(transcript_log, 'a') as f:
+                            f.write(f"\n{'='*80}\n")
+                            f.write(f"[{timestamp}] Duration: {duration_seconds:.1f}s\n")
+                            f.write(f"{text}\n")
 
-            except FuturesTimeoutError:
-                logging.error(f"Transcription timed out after {timeout_seconds}s")
-                rumps.notification(
-                    title="Dictation",
-                    subtitle="Transcription timed out",
-                    message=f"Audio took too long to transcribe. Try a smaller/faster model."
-                )
-                future.cancel()
-                return ""
+                    return text
+
+                except FuturesTimeoutError:
+                    # Timeout - don't retry, just fail
+                    logging.error(f"Transcription timed out after {timeout_seconds}s")
+                    rumps.notification(
+                        title="Dictation",
+                        subtitle="Transcription timed out",
+                        message=f"Audio took too long to transcribe. Try a smaller/faster model."
+                    )
+                    future.cancel()
+                    return ""
+
+                except Exception as e:
+                    # Capture error for potential retry
+                    error_type = type(e).__name__
+
+                    if attempt < MAX_TRANSCRIPTION_RETRIES:
+                        # Retry on model/inference errors
+                        logging.warning(f"Transcription attempt {attempt + 1} failed ({error_type}): {e}. Retrying...")
+                        time.sleep(0.5)  # Brief delay before retry
+                        continue
+                    else:
+                        # Final failure after all retries
+                        logging.error(f"Transcription failed after {MAX_TRANSCRIPTION_RETRIES + 1} attempts ({error_type}): {e}", exc_info=True)
+                        rumps.notification(
+                            title="Dictation",
+                            subtitle="Transcription failed",
+                            message=f"Error after {MAX_TRANSCRIPTION_RETRIES + 1} attempts: {error_type}. Try again or switch models."
+                        )
+                        return ""
 
         finally:
             if temp_path:
@@ -477,7 +503,17 @@ def transcribe_recorded_audio(audio_chunks):
                     logging.warning(f"Failed to delete temp file: {e}")
 
     except Exception as e:
-        logging.error(f"Transcription error: {e}")
+        # Catch-all for file I/O errors (numpy, wave operations)
+        # Whisper errors are handled in retry loop above
+        error_type = type(e).__name__
+        logging.error(f"Audio processing error ({error_type}): {e}", exc_info=True)
+
+        # Notify user of the failure
+        rumps.notification(
+            title="Dictation",
+            subtitle="Audio processing failed",
+            message=f"Error: {error_type}. Check microphone and try again."
+        )
         return ""
 
 def type_text(text):
