@@ -12,7 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Icon feedback** - Menu bar icon changes to 💭 (thinking) during transcription, 🎤 when ready
 - **Event consumption** - Right Command key events are consumed, preventing accidental system shortcuts during dictation
 - **Long transcript logging** - Transcriptions >30 seconds are automatically saved to `~/Library/Logs/Dictation_Transcripts.log`
-- **Transcript log menu item** - "Open Transcription Log" menu item provides one-click access to saved long dictations
+- **Transcript log menu item** - "Open Transcription Log" menu item provides one-click access to saved long dictations (PR #10)
+- **Model selection persistence** - Selected Whisper model now persists across app restarts via `~/Library/Application Support/Dictation/preferences.json` (PR #12)
+- **Retry logic for transcription** - Automatic retry (up to 3 attempts) for failed Whisper transcriptions with detailed error logging (PR #13)
 
 ### Changed
 - **Stream abort instead of stop** - Uses `abort()` instead of `stop()` to avoid waiting for pending buffers (eliminates deadlock)
