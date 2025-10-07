@@ -96,9 +96,13 @@ def release_single_instance_lock():
             logging.warning(f"Failed to release lock: {e}")
 
 def validate_model(model_name):
-    """Validate model name, return 'small' if invalid"""
-    valid_models = ["tiny", "base", "small", "medium", "large"]
-    return model_name if model_name in valid_models else "small"
+    """
+    Validate model name against VALID_MODELS list.
+
+    Returns:
+        str: The validated model name, or 'small' if invalid
+    """
+    return model_name if model_name in VALID_MODELS else "small"
 
 def load_preferences():
     """Load preferences from JSON file, return defaults if missing/corrupt"""
@@ -126,7 +130,13 @@ def load_preferences():
         return defaults
 
 def save_preferences(prefs_dict):
-    """Save preferences atomically to avoid corruption"""
+    """
+    Save preferences atomically to avoid corruption.
+
+    Uses atomic file operations: write to temp file, then rename.
+    This prevents corruption if the app crashes during save.
+    """
+    temp_file = None
     try:
         # Create directory if needed
         os.makedirs(os.path.dirname(PREFERENCES_FILE), exist_ok=True)
@@ -142,10 +152,11 @@ def save_preferences(prefs_dict):
     except Exception as e:
         logging.error(f"Failed to save preferences: {e}")
         # Clean up temp file if it exists
-        try:
-            os.unlink(temp_file)
-        except:
-            pass
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
 
 # Set ffmpeg path for bundled app (do this once at startup)
 os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + os.environ.get('PATH', '')
@@ -157,6 +168,7 @@ kVK_RightCommand = 0x36  # Virtual key code for Right Command
 kCGEventFlagMaskCommandLeft = 0x0008  # Left Command key bit in event flags
 TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 TRANSCRIPT_LOG_THRESHOLD = 30  # seconds - log transcriptions longer than this
+VALID_MODELS = ["tiny", "base", "small", "medium", "large"]  # Available Whisper models
 
 # Global state (queue-based architecture)
 command_queue = queue.Queue()  # Commands from event tap
