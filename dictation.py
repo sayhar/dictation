@@ -609,8 +609,16 @@ class DictationApp(rumps.App):
                 f.write(f"# Dictation Transcripts\n# Transcriptions longer than {TRANSCRIPT_LOG_THRESHOLD}s are logged here\n\n")
 
         # Open in default editor
-        subprocess.run(['open', transcript_log])
-        logging.info("Opened transcription log")
+        result = subprocess.run(['open', transcript_log], capture_output=True, text=True)
+        if result.returncode != 0:
+            logging.error(f"Failed to open transcript log: {result.stderr}")
+            rumps.notification(
+                title="Dictation",
+                subtitle="Error opening log",
+                message="Could not open transcript log file"
+            )
+        else:
+            logging.info("Opened transcription log")
 
     def setup_event_tap(self):
         """Setup event tap on main thread (required for run loop)"""
