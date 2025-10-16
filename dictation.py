@@ -180,7 +180,6 @@ recording_lock = threading.Lock()  # sounddevice callback runs on C thread (rele
 audio_capture_enabled = threading.Event()  # Safety net: disable callbacks before closing
 audio_capture_enabled.clear()  # Start disabled (stream will be created on demand)
 model = None
-audio_stream = None
 right_command_pressed = False
 typing_in_progress = False  # Flag to block Right Command during typing
 current_model = "small"  # Default model
@@ -347,7 +346,10 @@ def state_manager():
     in the order they were recorded, even if transcription finishes
     out-of-order.
     """
-    global recording_buffer, audio_capture_enabled, audio_stream
+    global recording_buffer, audio_capture_enabled
+
+    # Local to this thread - no cross-thread races
+    audio_stream = None
 
     # Recording state - track with simple flag, not complex state machine
     is_recording = False
@@ -419,13 +421,20 @@ def state_manager():
                         stream_ref = [None]
                         error_ref = [None]
 
+                        # Initialize buffer BEFORE creating stream (prevents race)
+                        with recording_lock:
+                            recording_buffer = []
+                        audio_capture_enabled.set()
+
                         def try_create():
                             try:
+                                # Create stream but don't start yet
                                 stream_ref[0] = sd.InputStream(
                                     callback=audio_callback,
                                     channels=CHANNELS,
                                     samplerate=SAMPLE_RATE
                                 )
+                                # Start stream - callbacks can now fire, but buffer is ready
                                 stream_ref[0].start()
                             except Exception as e:
                                 error_ref[0] = e
@@ -438,11 +447,6 @@ def state_manager():
                             if error_ref[0]:
                                 raise error_ref[0]
                             audio_stream = stream_ref[0]
-
-                            # Initialize buffer with lock, enable capture
-                            with recording_lock:
-                                recording_buffer = []
-                            audio_capture_enabled.set()
 
                             creation_time = time.time() - start_time
                             logging.info(f"Recording started (chunk {current_chunk_id})")
@@ -457,11 +461,23 @@ def state_manager():
                             creation_failures += 1
                             logging.error(f"Stream creation timed out after 2s - PortAudio blocked (failure #{creation_failures})")
 
-                            rumps.notification(
-                                title="Dictation - Audio Error",
-                                subtitle="Cannot create audio stream",
-                                message=f"PortAudio blocked (likely by leaked stream). Restart app to fix."
-                            )
+                            # After 3 failures, force restart (PortAudio is broken)
+                            if creation_failures >= 3:
+                                rumps.notification(
+                                    title="Dictation - Restart Required",
+                                    subtitle="Audio system blocked",
+                                    message="App will quit in 3 seconds. Please relaunch to fix audio."
+                                )
+                                logging.critical(f"Reached {creation_failures} creation failures - forcing quit")
+                                time.sleep(3)
+                                release_single_instance_lock()
+                                rumps.quit_application()
+                            else:
+                                rumps.notification(
+                                    title="Dictation - Audio Error",
+                                    subtitle="Cannot create audio stream",
+                                    message=f"Recording unavailable. Try quitting if this persists ({creation_failures}/3 failures)."
+                                )
 
                             audio_stream = None
                             is_recording = False
@@ -927,8 +943,7 @@ class DictationApp(rumps.App):
         # Update status
         self.menu["Status: Loading..."].title = "Status: Ready"
 
-        # Stream will be created on-demand (on first COMMAND_DOWN)
-        audio_stream = None
+        # Stream will be created on-demand by state_manager (on first COMMAND_DOWN)
         logging.info("Audio stream will be created on first recording")
 
         # Start state manager thread
