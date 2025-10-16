@@ -176,7 +176,7 @@ MAX_ABANDONED_STREAMS = 10  # Force restart after this many leaked streams
 # Global state (queue-based architecture)
 command_queue = queue.Queue()  # Commands from event tap
 recording_buffer = None  # None = not recording, list = currently recording
-recording_lock = threading.Lock()  # Protects recording_buffer - needed despite GIL for multi-callback safety
+recording_lock = threading.Lock()  # sounddevice callback runs on C thread (releases GIL) - lock prevents races
 audio_capture_enabled = threading.Event()  # Safety net: disable callbacks before closing
 audio_capture_enabled.clear()  # Start disabled (stream will be created on demand)
 model = None
@@ -186,6 +186,7 @@ typing_in_progress = False  # Flag to block Right Command during typing
 current_model = "small"  # Default model
 app_instance = None  # Reference to DictationApp instance for updating icon
 abandoned_streams = 0  # Track leaked streams from deadlocked close() calls
+creation_failures = 0  # Track failed stream creations (separate from actual leaks)
 close_thread_counter = 0  # Counter for naming close threads
 
 # Thread pool executor for running transcription with timeout
@@ -283,14 +284,10 @@ def close_stream_with_timeout(stream, timeout=STREAM_CLOSE_TIMEOUT):
             f"abandoning stream (total leaks: {abandoned_streams})"
         )
 
-        # Update menu bar if app is running
+        # Update menu bar if app is running (thread-safe via rumps __setitem__)
         if app_instance:
             try:
-                # Update leaked streams counter in menu
-                for item in app_instance.menu:
-                    if isinstance(item, rumps.MenuItem) and hasattr(item, 'title') and 'Leaked streams' in item.title:
-                        item.title = f"⚠️ Leaked streams: {abandoned_streams}"
-                        break
+                app_instance.menu["⚠️ Leaked streams: 0"].title = f"⚠️ Leaked streams: {abandoned_streams}"
             except Exception as e:
                 logging.warning(f"Failed to update menu: {e}")
 
@@ -304,12 +301,14 @@ def close_stream_with_timeout(stream, timeout=STREAM_CLOSE_TIMEOUT):
 
         # Force restart after threshold to prevent system audio issues
         if abandoned_streams >= MAX_ABANDONED_STREAMS:
-            rumps.alert(
+            # Use notification instead of alert (non-blocking, safe from background thread)
+            rumps.notification(
                 title="Dictation - Restart Required",
-                message=f"App has leaked {abandoned_streams} audio streams, which can slow down system audio. "
-                        f"Click OK to quit and restart the app.",
-                ok="Quit Now"
+                subtitle=f"{abandoned_streams} streams leaked",
+                message="App will quit in 3 seconds to free resources. Please relaunch."
             )
+            logging.critical(f"Reached {abandoned_streams} leaked streams - forcing quit")
+            time.sleep(3)  # Give user time to see notification
             release_single_instance_lock()
             rumps.quit_application()
 
@@ -412,6 +411,7 @@ def state_manager():
                     # Create fresh stream every time (ensures mic turns off between recordings)
                     # Note: If previous stream was abandoned (deadlock), PortAudio might block here
                     try:
+                        start_time = time.time()
                         logging.info(f"Creating new audio stream for chunk {current_chunk_id}")
 
                         # Create stream with a timeout to detect if PortAudio is blocked
@@ -444,31 +444,24 @@ def state_manager():
                                 recording_buffer = []
                             audio_capture_enabled.set()
 
-                            logging.info(f"Recording started (chunk {current_chunk_id}) - latency incurred for stream creation")
+                            creation_time = time.time() - start_time
+                            logging.info(f"Recording started (chunk {current_chunk_id})")
+                            if creation_time > 0.1:  # Log if slow (>100ms)
+                                logging.warning(f"Stream creation latency: {creation_time:.3f}s")
 
                             if app_instance:
                                 app_instance.title = "🎤"
                         else:
-                            # Stream creation timed out - PortAudio is blocked (previous leak)
-                            abandoned_streams += 1
-                            logging.error(f"Stream creation timed out after 2s - PortAudio blocked (total leaks: {abandoned_streams})")
+                            # Stream creation timed out - PortAudio blocked (likely by previous leak)
+                            # Don't count as leak (no resources created), but track failures
+                            creation_failures += 1
+                            logging.error(f"Stream creation timed out after 2s - PortAudio blocked (failure #{creation_failures})")
 
-                            # Check restart threshold
-                            if abandoned_streams >= MAX_ABANDONED_STREAMS:
-                                rumps.alert(
-                                    title="Dictation - Restart Required",
-                                    message=f"App has leaked {abandoned_streams} audio streams. "
-                                            f"Click OK to quit and restart the app.",
-                                    ok="Quit Now"
-                                )
-                                release_single_instance_lock()
-                                rumps.quit_application()
-                            else:
-                                rumps.notification(
-                                    title="Dictation - Audio Error",
-                                    subtitle="Cannot create audio stream",
-                                    message=f"Stream leak {abandoned_streams}/{MAX_ABANDONED_STREAMS}. Will auto-restart at limit."
-                                )
+                            rumps.notification(
+                                title="Dictation - Audio Error",
+                                subtitle="Cannot create audio stream",
+                                message=f"PortAudio blocked (likely by leaked stream). Restart app to fix."
+                            )
 
                             audio_stream = None
                             is_recording = False
