@@ -170,17 +170,23 @@ TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 TRANSCRIPT_LOG_THRESHOLD = 30  # seconds - log transcriptions longer than this
 MAX_TRANSCRIPTION_RETRIES = 2  # number of retries for failed transcriptions
 VALID_MODELS = ["tiny", "base", "small", "medium", "large"]  # Available Whisper models
+STREAM_CLOSE_TIMEOUT = 2.0  # seconds - timeout for stream close before abandoning (conservative for slow systems)
+MAX_ABANDONED_STREAMS = 10  # Force restart after this many leaked streams
 
 # Global state (queue-based architecture)
 command_queue = queue.Queue()  # Commands from event tap
 recording_buffer = None  # None = not recording, list = currently recording
-recording_lock = threading.Lock()  # Protects recording_buffer
+recording_lock = threading.Lock()  # sounddevice callback runs on C thread (releases GIL) - lock prevents races
+audio_capture_enabled = threading.Event()  # Safety net: disable callbacks before closing
+audio_capture_enabled.clear()  # Start disabled (stream will be created on demand)
 model = None
-audio_stream = None
 right_command_pressed = False
 typing_in_progress = False  # Flag to block Right Command during typing
 current_model = "small"  # Default model
 app_instance = None  # Reference to DictationApp instance for updating icon
+abandoned_streams = 0  # Track leaked streams from deadlocked close() calls
+creation_failures = 0  # Track failed stream creations (separate from actual leaks)
+close_thread_counter = 0  # Counter for naming close threads
 
 # Thread pool executor for running transcription with timeout
 # Use max_workers=2 to allow one timeout to run while a new transcription starts
@@ -226,13 +232,104 @@ def load_model(model_name=None):
     model = whisper.load_model(current_model)
     logging.info("Model loaded successfully")
 
+def close_stream_with_timeout(stream, timeout=STREAM_CLOSE_TIMEOUT):
+    """
+    Attempt to close an audio stream with a timeout.
+
+    PortAudio's close() can deadlock when the callback thread is stuck.
+    This wrapper detects the deadlock and abandons the stream to prevent
+    the app from hanging forever.
+
+    Resource leak on timeout (per deadlock):
+    - 1 Python daemon thread (blocked in C code, ~1-8MB stack)
+    - 1 PortAudio callback thread (~512KB + RT priority)
+    - 1 CoreAudio audio unit instance + file descriptors
+    - ~1-2MB memory total per leak
+
+    After 10 leaks, the app forces restart to prevent system audio degradation.
+
+    Returns:
+        True if stream closed successfully
+        False if close() deadlocked (stream abandoned, resources leaked)
+    """
+    global abandoned_streams, close_thread_counter
+
+    close_done = threading.Event()
+    close_thread_counter += 1
+    thread_name = f"StreamClose-{close_thread_counter}"
+
+    def try_close():
+        try:
+            stream.close()  # Hangs here on deadlock (no exception thrown)
+        except Exception as e:
+            # Legitimate errors (device disconnected, etc.) - not deadlocks
+            logging.error(f"Close error (not deadlock): {e}")
+        finally:
+            # Always set flag - either close() returned or raised exception
+            # If deadlock occurs, this line never executes (thread stuck in C)
+            close_done.set()
+
+    # Start close in background thread
+    threading.Thread(target=try_close, daemon=True, name=thread_name).start()
+
+    # Wait for close to complete (or timeout)
+    if close_done.wait(timeout=timeout):
+        logging.debug(f"Stream closed successfully within {timeout}s")
+        return True
+    else:
+        abandoned_streams += 1
+        logging.error(
+            f"stream.close() deadlocked after {timeout}s - "
+            f"abandoning stream (total leaks: {abandoned_streams})"
+        )
+
+        # Update menu bar if app is running (thread-safe via rumps __setitem__)
+        if app_instance:
+            try:
+                app_instance.menu["⚠️ Leaked streams: 0"].title = f"⚠️ Leaked streams: {abandoned_streams}"
+            except Exception as e:
+                logging.warning(f"Failed to update menu: {e}")
+
+        # Alert user if leaks accumulate
+        if abandoned_streams == 5:
+            rumps.notification(
+                title="Dictation - Resource Warning",
+                subtitle=f"{abandoned_streams} audio streams leaked",
+                message="Recording still works, but app will auto-restart at 10 leaks"
+            )
+
+        # Force restart after threshold to prevent system audio issues
+        if abandoned_streams >= MAX_ABANDONED_STREAMS:
+            # Use notification instead of alert (non-blocking, safe from background thread)
+            rumps.notification(
+                title="Dictation - Restart Required",
+                subtitle=f"{abandoned_streams} streams leaked",
+                message="App will quit in 3 seconds to free resources. Please relaunch."
+            )
+            logging.critical(f"Reached {abandoned_streams} leaked streams - forcing quit")
+            time.sleep(3)  # Give user time to see notification
+            release_single_instance_lock()
+            rumps.quit_application()
+
+        return False
+
 def audio_callback(indata, frames, time, status):
     """
     Callback for audio recording (runs on sounddevice thread)
 
     This is called ~100 times/second when audio stream is active.
     Simply appends audio data to the recording buffer - no complex logic.
+
+    Safety net: Returns immediately if capture disabled to ensure callbacks
+    aren't active when we close the stream. The timeout wrapper (close_stream_with_timeout)
+    prevents deadlocks even if this callback holds the lock.
     """
+    # Early return if capture disabled (safety net for stream close)
+    if not audio_capture_enabled.is_set():
+        return
+
+    # Lock is needed: recording_buffer is accessed from multiple threads
+    # Timeout wrapper prevents deadlocks if callback holds lock during close()
     with recording_lock:
         if recording_buffer is not None:
             recording_buffer.append(indata.copy())
@@ -249,7 +346,10 @@ def state_manager():
     in the order they were recorded, even if transcription finishes
     out-of-order.
     """
-    global recording_buffer
+    global recording_buffer, audio_capture_enabled, creation_failures
+
+    # Local to this thread - no cross-thread races
+    audio_stream = None
 
     # Recording state - track with simple flag, not complex state machine
     is_recording = False
@@ -310,23 +410,89 @@ def state_manager():
                     current_chunk_id = next_chunk_to_record
                     next_chunk_to_record += 1
 
-                    with recording_lock:
-                        recording_buffer = []
+                    # Create fresh stream every time (ensures mic turns off between recordings)
+                    # Note: If previous stream was abandoned (deadlock), PortAudio might block here
+                    try:
+                        start_time = time.time()
+                        logging.info(f"Creating new audio stream for chunk {current_chunk_id}")
 
-                    if audio_stream and not audio_stream.active:
-                        try:
-                            audio_stream.start()
+                        # Create stream with a timeout to detect if PortAudio is blocked
+                        create_done = threading.Event()
+                        stream_ref = [None]  # List allows closure mutation (threading doesn't return values)
+                        error_ref = [None]
+
+                        # Initialize buffer BEFORE creating stream (prevents race)
+                        with recording_lock:
+                            recording_buffer = []
+                        audio_capture_enabled.set()
+
+                        def try_create():
+                            try:
+                                # Create stream but don't start yet
+                                stream_ref[0] = sd.InputStream(
+                                    callback=audio_callback,
+                                    channels=CHANNELS,
+                                    samplerate=SAMPLE_RATE
+                                )
+                                # Start stream - callbacks can now fire, but buffer is ready
+                                stream_ref[0].start()
+                            except Exception as e:
+                                error_ref[0] = e
+                            finally:
+                                create_done.set()
+
+                        threading.Thread(target=try_create, daemon=True, name="StreamCreate").start()
+
+                        if create_done.wait(timeout=2.0):
+                            if error_ref[0]:
+                                raise error_ref[0]
+                            audio_stream = stream_ref[0]
+                            creation_failures = 0  # Reset counter on success
+
+                            creation_time = time.time() - start_time
                             logging.info(f"Recording started (chunk {current_chunk_id})")
+                            if creation_time > 0.1:  # Log if slow (>100ms)
+                                logging.warning(f"Stream creation latency: {creation_time:.3f}s")
+
                             if app_instance:
                                 app_instance.title = "🎤"
-                        except Exception as e:
-                            logging.error(f"Failed to start audio stream: {e}")
-                            with recording_lock:
-                                recording_buffer = None
+                        else:
+                            # Stream creation timed out - PortAudio blocked (likely by previous leak)
+                            creation_failures += 1
+                            logging.error(f"Stream creation timed out after 2s - PortAudio blocked (failure #{creation_failures})")
+
+                            # If stream was actually created (slow, not blocked), clean it up
+                            if stream_ref[0] is not None:
+                                logging.warning("Stream created after timeout - closing abandoned stream")
+                                close_stream_with_timeout(stream_ref[0], timeout=1.0)
+
+                            # After 3 failures, force restart (PortAudio is broken)
+                            if creation_failures >= 3:
+                                rumps.notification(
+                                    title="Dictation - Restart Required",
+                                    subtitle="Audio system blocked",
+                                    message="App will quit in 3 seconds. Please relaunch to fix audio."
+                                )
+                                logging.critical(f"Reached {creation_failures} creation failures - forcing quit")
+                                time.sleep(3)
+                                release_single_instance_lock()
+                                rumps.quit_application()
+                            else:
+                                rumps.notification(
+                                    title="Dictation - Audio Error",
+                                    subtitle="Cannot create audio stream",
+                                    message=f"Recording unavailable. Try quitting if this persists ({creation_failures}/3 failures)."
+                                )
+
+                            audio_stream = None
                             is_recording = False
-                    else:
-                        # This shouldn't happen - stream should be inactive when starting new recording
-                        logging.warning(f"Recording new chunk {current_chunk_id} but stream already active - unexpected state")
+                            audio_capture_enabled.clear()
+
+                    except Exception as e:
+                        logging.error(f"Failed to create/start audio stream: {e}")
+                        audio_stream = None
+                        is_recording = False
+                        audio_capture_enabled.clear()
 
             # Handle COMMAND_UP
             elif msg == 'COMMAND_UP':
@@ -336,30 +502,34 @@ def state_manager():
                     chunk_id = current_chunk_id
                     current_chunk_id = None
 
-                    # Stop audio stream and wait for it to actually stop
-                    if audio_stream and audio_stream.active:
-                        try:
-                            audio_stream.stop()  # Blocks until stream is stopped
-                            logging.info(f"Recording stopped (chunk {chunk_id})")
-                        except Exception as e:
-                            logging.error(f"Failed to stop audio stream: {e}")
+                    # STEP 1: Disable callbacks (safety net)
+                    audio_capture_enabled.clear()
 
-                    # Wait for any in-flight callbacks to complete
-                    # The callback might have been scheduled before stop() was called
-                    # 50ms = 5 callback cycles at 100/sec - very safe
-                    time.sleep(0.05)
+                    # STEP 2: Wait for in-flight callbacks to see the flag
+                    time.sleep(0.05)  # 5 callback cycles at 100/sec
 
-                    # Now grab the recorded audio
+                    # STEP 3: Grab audio with lock (callbacks are disabled but lock ensures consistency)
                     with recording_lock:
-                        recorded_audio = recording_buffer[:]
-                        recording_buffer = None  # Stop recording
+                        recorded_audio = recording_buffer[:] if recording_buffer else []
+                        recording_buffer = None
 
-                    # Update icon to show transcribing
+                    logging.info(f"Recording stopped (chunk {chunk_id}) - audio captured")
+
+                    # STEP 4: Close stream with timeout (turns off mic indicator)
+                    # PortAudio's close() can deadlock - use timeout wrapper to prevent hangs
+                    if audio_stream:
+                        success = close_stream_with_timeout(audio_stream, timeout=STREAM_CLOSE_TIMEOUT)
+                        if success:
+                            logging.info("Audio stream closed - mic indicator turned off")
+                        else:
+                            logging.warning("Stream close deadlocked - abandoned (will recreate fresh next time)")
+                        audio_stream = None  # Always discard handle, even if deadlocked
+
+                    # STEP 5: Continue with transcription
                     if app_instance:
                         app_instance.title = "💭"
 
                     # Spawn transcription thread
-                    # IMPORTANT: Capture chunk_id in closure properly
                     def do_transcription(cid=chunk_id, audio=recorded_audio):
                         try:
                             result = transcribe_recorded_audio(audio)
@@ -669,6 +839,7 @@ class DictationApp(rumps.App):
 
         self.menu = [
             rumps.MenuItem("Status: Loading...", callback=None),
+            rumps.MenuItem("⚠️ Leaked streams: 0", callback=None),
             None,  # Separator
             rumps.MenuItem("Hotkey: Right Command (hold)", callback=None),
             None,
@@ -769,22 +940,14 @@ class DictationApp(rumps.App):
 
     def init_app(self):
         """Initialize the app (load model, start listeners)"""
-        global audio_stream
-
         # Load model
         load_model()
 
         # Update status
         self.menu["Status: Loading..."].title = "Status: Ready"
 
-        # Create audio stream but don't start until recording
-        self.audio_stream = sd.InputStream(
-            callback=audio_callback,
-            channels=CHANNELS,
-            samplerate=SAMPLE_RATE
-        )
-        audio_stream = self.audio_stream  # Keep global reference for callbacks
-        logging.info("Audio stream created (will start on key press)")
+        # Stream will be created on-demand by state_manager (on first COMMAND_DOWN)
+        logging.info("Audio stream will be created on first recording")
 
         # Start state manager thread
         threading.Thread(target=state_manager, daemon=True).start()
