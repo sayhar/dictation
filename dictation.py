@@ -346,7 +346,7 @@ def state_manager():
     in the order they were recorded, even if transcription finishes
     out-of-order.
     """
-    global recording_buffer, audio_capture_enabled
+    global recording_buffer, audio_capture_enabled, creation_failures
 
     # Local to this thread - no cross-thread races
     audio_stream = None
@@ -447,6 +447,7 @@ def state_manager():
                             if error_ref[0]:
                                 raise error_ref[0]
                             audio_stream = stream_ref[0]
+                            creation_failures = 0  # Reset counter on success
 
                             creation_time = time.time() - start_time
                             logging.info(f"Recording started (chunk {current_chunk_id})")
@@ -457,9 +458,13 @@ def state_manager():
                                 app_instance.title = "🎤"
                         else:
                             # Stream creation timed out - PortAudio blocked (likely by previous leak)
-                            # Don't count as leak (no resources created), but track failures
                             creation_failures += 1
                             logging.error(f"Stream creation timed out after 2s - PortAudio blocked (failure #{creation_failures})")
+
+                            # If stream was actually created (slow, not blocked), clean it up
+                            if stream_ref[0] is not None:
+                                logging.warning("Stream created after timeout - closing abandoned stream")
+                                close_stream_with_timeout(stream_ref[0], timeout=1.0)
 
                             # After 3 failures, force restart (PortAudio is broken)
                             if creation_failures >= 3:
