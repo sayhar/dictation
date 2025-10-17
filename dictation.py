@@ -246,7 +246,7 @@ def close_stream_with_timeout(stream, timeout=STREAM_CLOSE_TIMEOUT):
     - 1 CoreAudio audio unit instance + file descriptors
     - ~1-2MB memory total per leak
 
-    After 30 leaks, the app forces restart to prevent system audio degradation.
+    After 10 leaks, the app forces restart to prevent system audio degradation.
 
     Returns:
         True if stream closed successfully
