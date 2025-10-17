@@ -418,7 +418,7 @@ def state_manager():
 
                         # Create stream with a timeout to detect if PortAudio is blocked
                         create_done = threading.Event()
-                        stream_ref = [None]
+                        stream_ref = [None]  # List allows closure mutation (threading doesn't return values)
                         error_ref = [None]
 
                         # Initialize buffer BEFORE creating stream (prevents race)
@@ -935,8 +935,6 @@ class DictationApp(rumps.App):
 
     def init_app(self):
         """Initialize the app (load model, start listeners)"""
-        global audio_stream
-
         # Load model
         load_model()
 
