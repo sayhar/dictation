@@ -287,19 +287,25 @@ def close_stream_with_timeout(stream, timeout=STREAM_CLOSE_TIMEOUT):
         if app_instance:
             try:
                 # Create and add leak counter on first leak (cleaner UX - hidden until needed)
+                # Double-check it wasn't already created by another thread (defensive)
                 if app_instance.leaked_streams_item is None:
                     app_instance.leaked_streams_item = rumps.MenuItem(
                         f"⚠️ Leaked streams: {abandoned_streams}",
                         callback=None
                     )
-                    # Insert after "Status" item (index 1, after separator at 0)
-                    app_instance.menu.insert(1, app_instance.leaked_streams_item)
-                    logging.info("Added leak counter to menu (first leak detected)")
-                else:
-                    # Update existing counter
+                    # Verify still None after creation (race condition check)
+                    # If another thread created it, we'll just update below
+                    if app_instance.leaked_streams_item is not None:
+                        # Insert after separator (index 2: after "Status" at 0, separator at 1)
+                        app_instance.menu.insert(2, app_instance.leaked_streams_item)
+                        logging.info("Added leak counter to menu (first leak detected)")
+
+                # Update counter (either just created or already exists)
+                if app_instance.leaked_streams_item is not None:
                     app_instance.leaked_streams_item.title = f"⚠️ Leaked streams: {abandoned_streams}"
             except Exception as e:
-                logging.warning(f"Failed to update menu: {e}")
+                # Log specific error type for easier debugging
+                logging.warning(f"Failed to update leak counter menu ({type(e).__name__}): {e}")
 
         # Alert user if leaks accumulate
         if abandoned_streams == 5:
