@@ -63,6 +63,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("AppDelegate: setting up keyboard monitor")
         setupKeyboardMonitor()
 
+        // Subscribe to wake notifications to re-enable event tap
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+
         NSLog("AppDelegate: startup complete")
         print("Dictation app started successfully")
     }
@@ -70,6 +78,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         SingleInstanceLock.release()
         keyboardMonitor.stop()
+    }
+
+    @objc private func handleWake() {
+        NSLog("AppDelegate: System woke from sleep, re-enabling keyboard monitor")
+        keyboardMonitor.ensureEnabled()
     }
 
     // MARK: - Setup
@@ -200,19 +213,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     model: preferences.selectedModel
                 )
 
-                if !text.isEmpty {
-                    await MainActor.run {
+                await MainActor.run {
+                    if !text.isEmpty {
                         textInjector.typeText(text)
+                    } else {
+                        NSLog("AppDelegate: Transcription returned empty text")
+                        self.showError("Transcription returned empty")
                     }
                 }
             } catch {
-                print("Transcription error: \(error)")
+                NSLog("AppDelegate: Transcription FAILED: \(error)")
+                await MainActor.run {
+                    self.showError("Transcription failed: \(error.localizedDescription)")
+                }
             }
 
             await MainActor.run {
                 self.resetIcon()
             }
         }
+    }
+
+    private func showError(_ message: String) {
+        // Flash the icon red briefly to indicate error
+        statusItem.button?.title = "❌"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.resetIcon()
+        }
+
+        // Also log prominently
+        NSLog("AppDelegate ERROR: \(message)")
     }
 
     private func resetIcon() {

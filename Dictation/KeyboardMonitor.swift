@@ -122,6 +122,20 @@ class KeyboardMonitor {
         print("Keyboard monitor stopped")
     }
 
+    /// Re-enables the event tap if it exists but was disabled (e.g., after sleep).
+    /// If tap doesn't exist, restarts the monitor entirely.
+    func ensureEnabled() {
+        if let tap = eventTap {
+            // Re-enable existing tap
+            CGEvent.tapEnable(tap: tap, enable: true)
+            NSLog("KeyboardMonitor: re-enabled existing tap")
+        } else {
+            // Tap doesn't exist, restart monitor
+            NSLog("KeyboardMonitor: tap was nil, restarting monitor")
+            start()
+        }
+    }
+
     // MARK: - Private Methods
 
     private func handleEvent(
