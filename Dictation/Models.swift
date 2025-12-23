@@ -19,6 +19,19 @@ enum WhisperModel: String, CaseIterable, Codable {
         case .large: return "Large (most accurate)"
         }
     }
+
+    /// MLX Whisper HuggingFace repo name for this model
+    /// Uses English-only models (.en) for tiny/base/small/medium - faster & more accurate for English
+    /// Large uses v3-turbo (no .en variant exists for large)
+    var mlxRepo: String {
+        switch self {
+        case .tiny: return "mlx-community/whisper-tiny.en-mlx"
+        case .base: return "mlx-community/whisper-base.en-mlx"
+        case .small: return "mlx-community/whisper-small.en-mlx"
+        case .medium: return "mlx-community/whisper-medium.en-mlx"
+        case .large: return "mlx-community/whisper-large-v3-turbo"
+        }
+    }
 }
 
 /// Errors that can occur during transcription

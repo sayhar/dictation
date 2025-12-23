@@ -39,6 +39,7 @@ class TranscriptionService {
         let timeout: TimeInterval = audioDuration < 5 ? 15 : max(baseTimeout, audioDuration * 2)
 
         NSLog("TranscriptionService: Transcribing %.1fs of audio with %@ model (timeout: %.0fs)", audioDuration, model.rawValue, timeout)
+        NSLog("TranscriptionService: Audio data size: %d bytes", audioData.count)
 
         // Write audio to temp file
         let tempURL = FileManager.default.temporaryDirectory
@@ -46,6 +47,7 @@ class TranscriptionService {
             .appendingPathExtension("wav")
 
         try audioData.write(to: tempURL)
+
         defer {
             try? FileManager.default.removeItem(at: tempURL)
         }
@@ -94,21 +96,34 @@ class TranscriptionService {
         let outputPipe = Pipe()
         let errorPipe = Pipe()
 
-        // Use the system Python with whisper installed
+        // Use the system Python with mlx-whisper installed
         // We invoke it through a shell to ensure proper PATH
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         // Build the Python script as a separate string to avoid multi-line escaping issues
+        // MLX Whisper is 30-40% faster on Apple Silicon (uses Metal GPU)
         let pythonScript = """
-            import whisper
-            model = whisper.load_model('\(model.rawValue)')
-            result = model.transcribe('\(audioPath)', language='en')
+            import mlx_whisper
+            result = mlx_whisper.transcribe('\(audioPath)', path_or_hf_repo='\(model.mlxRepo)')
             print(result['text'])
             """
 
         let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-        let bashCommand = "source ~/.zshrc 2>/dev/null || true; cd \"\(homeDir)/code/claudeDash/dictation-app\" && uv run python -c \"\(pythonScript.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "; "))\""
+        // Use venv's Python directly - already has mlx_whisper installed
+        // TODO: Make this configurable or bundle Python with the app
+        let pythonPath = "\(homeDir)/code/claudeDash/dictation-app/.venv/bin/python"
+        let escapedScript = pythonScript.replacingOccurrences(of: "'", with: "'\\''")
 
-        process.arguments = ["-c", bashCommand]
+        process.arguments = ["-c", "\"\(pythonPath)\" -c '\(escapedScript)'"]
+
+        // Set environment to include ffmpeg path (needed by mlx_whisper for audio loading)
+        var environment = ProcessInfo.processInfo.environment
+        let ffmpegPaths = "/opt/homebrew/bin:/usr/local/bin"
+        if let existingPath = environment["PATH"] {
+            environment["PATH"] = "\(ffmpegPaths):\(existingPath)"
+        } else {
+            environment["PATH"] = ffmpegPaths
+        }
+        process.environment = environment
 
         process.standardOutput = outputPipe
         process.standardError = errorPipe

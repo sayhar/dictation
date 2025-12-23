@@ -4,7 +4,7 @@ Push-to-Talk Dictation using Whisper
 Hold Right Command key to record and transcribe speech
 """
 
-import whisper
+import mlx_whisper
 import sounddevice as sd
 import numpy as np
 import pyperclip
@@ -170,6 +170,15 @@ TRANSCRIPTION_TIMEOUT = 120  # seconds - max time for transcription
 TRANSCRIPT_LOG_THRESHOLD = 30  # seconds - log transcriptions longer than this
 MAX_TRANSCRIPTION_RETRIES = 2  # number of retries for failed transcriptions
 VALID_MODELS = ["tiny", "base", "small", "medium", "large"]  # Available Whisper models
+
+# MLX Whisper repos (English-only for speed, large uses turbo)
+MLX_REPOS = {
+    "tiny": "mlx-community/whisper-tiny.en-mlx",
+    "base": "mlx-community/whisper-base.en-mlx",
+    "small": "mlx-community/whisper-small.en-mlx",
+    "medium": "mlx-community/whisper-medium.en-mlx",
+    "large": "mlx-community/whisper-large-v3-turbo",
+}
 STREAM_CLOSE_TIMEOUT = 2.0  # seconds - timeout for stream close before abandoning (conservative for slow systems)
 MAX_ABANDONED_STREAMS = 10  # Force restart after this many leaked streams
 
@@ -224,13 +233,12 @@ def is_command_physically_held():
         return False  # Assume not held on error
 
 def load_model(model_name=None):
-    """Load Whisper model"""
-    global model, current_model
+    """Set Whisper model (MLX loads on first transcribe)"""
+    global current_model
     if model_name:
         current_model = model_name
-    logging.info(f"Loading Whisper model ({current_model})...")
-    model = whisper.load_model(current_model)
-    logging.info("Model loaded successfully")
+    logging.info(f"Model set to {current_model} (MLX repo: {MLX_REPOS[current_model]})")
+    logging.info("Model loaded successfully")  # MLX loads lazily on first transcribe
 
 def close_stream_with_timeout(stream, timeout=STREAM_CLOSE_TIMEOUT):
     """
@@ -630,10 +638,13 @@ def transcribe_recorded_audio(audio_chunks):
             # Transcribe with timeout and retry logic
             logging.info(f"Starting transcription (audio: {duration_seconds:.1f}s, timeout: {timeout_seconds}s)")
 
-            # Retry loop wraps only model.transcribe() call
+            # Retry loop wraps only transcribe() call
             for attempt in range(MAX_TRANSCRIPTION_RETRIES + 1):
                 try:
-                    future = transcription_executor.submit(lambda: model.transcribe(temp_path, language="en"))
+                    repo = MLX_REPOS[current_model]
+                    future = transcription_executor.submit(
+                        lambda p=temp_path, r=repo: mlx_whisper.transcribe(p, path_or_hf_repo=r)
+                    )
                     result = future.result(timeout=timeout_seconds)
                     text = result["text"].strip()
 

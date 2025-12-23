@@ -27,6 +27,12 @@ cp ".build/release/Dictation" "${MACOS_DIR}/${APP_NAME}"
 # Copy Info.plist
 cp "Dictation/Info.plist" "${CONTENTS_DIR}/Info.plist"
 
+# Copy icon if exists
+if [ -f "Swift_Dictation.icns" ]; then
+    cp "Swift_Dictation.icns" "${RESOURCES_DIR}/AppIcon.icns"
+    echo "Copied app icon"
+fi
+
 # Update executable name in Info.plist
 sed -i '' "s/\$(EXECUTABLE_NAME)/${APP_NAME}/g" "${CONTENTS_DIR}/Info.plist"
 sed -i '' "s/\$(PRODUCT_BUNDLE_IDENTIFIER)/com.dictation.swift/g" "${CONTENTS_DIR}/Info.plist"
@@ -36,9 +42,9 @@ sed -i '' "s/\$(MACOSX_DEPLOYMENT_TARGET)/13.0/g" "${CONTENTS_DIR}/Info.plist"
 # Create PkgInfo
 echo -n "APPL????" > "${CONTENTS_DIR}/PkgInfo"
 
-# Sign the app so macOS recognizes it properly for permissions
+# Sign the app with entitlements for automation permission
 echo "Signing app..."
-codesign --force --deep --sign - "${BUNDLE_DIR}"
+codesign --force --deep --sign - --entitlements "Dictation.entitlements" "${BUNDLE_DIR}"
 
 echo "Built: ${BUNDLE_DIR}"
 echo ""

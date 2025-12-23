@@ -215,17 +215,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
                 await MainActor.run {
                     if !text.isEmpty {
-                        textInjector.typeText(text)
-                    } else {
-                        NSLog("AppDelegate: Transcription returned empty text")
-                        self.showError("Transcription returned empty")
+                        self.textInjector.typeText(text)
                     }
                 }
             } catch {
                 NSLog("AppDelegate: Transcription FAILED: \(error)")
-                await MainActor.run {
-                    self.showError("Transcription failed: \(error.localizedDescription)")
-                }
             }
 
             await MainActor.run {
