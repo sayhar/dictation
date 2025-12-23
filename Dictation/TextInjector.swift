@@ -13,34 +13,37 @@ class TextInjector {
 
     // MARK: - Public Methods
 
-    /// Types text using osascript subprocess (same as Python app).
+    /// Types the given text into the active application.
+    /// Uses clipboard-based paste to handle special characters correctly.
     func typeText(_ text: String) {
         guard !text.isEmpty else { return }
 
-        // Escape for AppleScript (same as Python)
-        let escaped = text
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
+        // Save current clipboard
+        let pasteboard = NSPasteboard.general
+        let savedContents = savePasteboardContents(pasteboard)
 
-        // Call osascript directly (subprocess, not NSAppleScript)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", "tell application \"System Events\" to keystroke \"\(escaped)\""]
+        // Set our text on clipboard
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
 
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            NSLog("TextInjector: osascript failed: \(error)")
-        }
+        // Small delay to ensure clipboard is ready
+        usleep(50000)  // 50ms
+
+        // Simulate Cmd+V
+        simulatePaste()
+
+        // Small delay before restoring clipboard
+        usleep(100000)  // 100ms
+
+        // Restore original clipboard
+        restorePasteboardContents(pasteboard, contents: savedContents)
     }
 
     // MARK: - Private Methods
 
     /// Simulates Cmd+V keystroke to paste from clipboard.
     private func simulatePaste() {
-        // Use combinedSessionState for better compatibility
-        let source = CGEventSource(stateID: .combinedSessionState)
+        let source = CGEventSource(stateID: .hidSystemState)
 
         // Key down for 'v' with Command modifier
         guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true) else {
@@ -56,12 +59,9 @@ class TextInjector {
         }
         keyUp.flags = .maskCommand
 
-        // Post to cghidEventTap for broader compatibility
-        keyDown.post(tap: .cghidEventTap)
-        usleep(10000)  // 10ms between key events
-        keyUp.post(tap: .cghidEventTap)
-
-        NSLog("TextInjector: Posted Cmd+V events")
+        // Post the events
+        keyDown.post(tap: .cgAnnotatedSessionEventTap)
+        keyUp.post(tap: .cgAnnotatedSessionEventTap)
     }
 
     /// Saves all pasteboard contents for later restoration.
