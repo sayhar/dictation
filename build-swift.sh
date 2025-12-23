@@ -42,6 +42,28 @@ sed -i '' "s/\$(MACOSX_DEPLOYMENT_TARGET)/13.0/g" "${CONTENTS_DIR}/Info.plist"
 # Create PkgInfo
 echo -n "APPL????" > "${CONTENTS_DIR}/PkgInfo"
 
+# Bundle Python environment (minimal - only mlx-whisper dependencies)
+echo "Bundling Python environment..."
+PYTHON_BUNDLE="${RESOURCES_DIR}/python"
+mkdir -p "${PYTHON_BUNDLE}/bin"
+mkdir -p "${PYTHON_BUNDLE}/lib"
+
+# Copy Python interpreter from uv's managed location
+UV_PYTHON="$HOME/.local/share/uv/python/cpython-3.13.5-macos-aarch64-none"
+if [ -d "${UV_PYTHON}" ]; then
+    # Copy just the bin and lib directories we need
+    cp -R "${UV_PYTHON}/bin" "${PYTHON_BUNDLE}/"
+    cp -R "${UV_PYTHON}/lib" "${PYTHON_BUNDLE}/"
+    echo "Copied Python 3.13 interpreter"
+fi
+
+# Install ONLY mlx-whisper and its dependencies to a clean location
+echo "Installing mlx-whisper to bundle..."
+uv pip install --target "${PYTHON_BUNDLE}/lib/python3.13/site-packages" \
+    mlx-whisper \
+    --quiet 2>&1 | grep -v "already satisfied" || true
+echo "Bundled Python environment complete"
+
 # Sign the app with entitlements for automation permission
 echo "Signing app..."
 codesign --force --deep --sign - --entitlements "Dictation.entitlements" "${BUNDLE_DIR}"

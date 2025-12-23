@@ -107,10 +107,11 @@ class TranscriptionService {
             print(result['text'])
             """
 
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-        // Use venv's Python directly - already has mlx_whisper installed
-        // TODO: Make this configurable or bundle Python with the app
-        let pythonPath = "\(homeDir)/code/claudeDash/dictation-app/.venv/bin/python"
+        // Use bundled Python from app Resources
+        guard let resourcePath = Bundle.main.resourcePath else {
+            throw TranscriptionError.transcriptionFailed("Cannot find app resources")
+        }
+        let pythonPath = "\(resourcePath)/python/bin/python3"
         let escapedScript = pythonScript.replacingOccurrences(of: "'", with: "'\\''")
 
         process.arguments = ["-c", "\"\(pythonPath)\" -c '\(escapedScript)'"]
