@@ -41,23 +41,15 @@ class TranscriptionService {
         NSLog("TranscriptionService: Transcribing %.1fs of audio with %@ model (timeout: %.0fs)", audioDuration, model.rawValue, timeout)
         NSLog("TranscriptionService: Audio data size: %d bytes", audioData.count)
 
-        // Write audio to temp file
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("wav")
-
-        try audioData.write(to: tempURL)
-
-        defer {
-            try? FileManager.default.removeItem(at: tempURL)
-        }
+        // Extract raw PCM data from WAV (skip 44-byte header)
+        let rawPCM = audioData.subdata(in: 44..<audioData.count)
 
         // Try transcription with retries
         var lastError: Error?
         for attempt in 1...maxRetries {
             do {
                 let text = try await runWhisperTranscription(
-                    audioPath: tempURL.path,
+                    audioData: rawPCM,
                     model: model,
                     timeout: timeout
                 )
@@ -86,49 +78,42 @@ class TranscriptionService {
     // MARK: - Private Methods
 
     private func runWhisperTranscription(
-        audioPath: String,
+        audioData: Data,
         model: WhisperModel,
         timeout: TimeInterval
     ) async throws -> String {
-        // Verify ffmpeg is available (required by mlx-whisper for audio loading)
-        try await checkFfmpegAvailable()
+        // No ffmpeg needed! We pass raw PCM data directly to Python
 
-        // Use Python whisper via command line
-        // This leverages the existing Python environment and model cache
         let process = Process()
+        let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
-
-        // Use the system Python with mlx-whisper installed
-        // We invoke it through a shell to ensure proper PATH
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        // Build the Python script as a separate string to avoid multi-line escaping issues
-        // MLX Whisper is 30-40% faster on Apple Silicon (uses Metal GPU)
-        let pythonScript = """
-            import mlx_whisper
-            result = mlx_whisper.transcribe('\(audioPath)', path_or_hf_repo='\(model.mlxRepo)')
-            print(result['text'])
-            """
 
         // Use bundled Python from app Resources
         guard let resourcePath = Bundle.main.resourcePath else {
             throw TranscriptionError.transcriptionFailed("Cannot find app resources")
         }
         let pythonPath = "\(resourcePath)/python/bin/python3"
-        let escapedScript = pythonScript.replacingOccurrences(of: "'", with: "'\\''")
 
-        process.arguments = ["-c", "\"\(pythonPath)\" -c '\(escapedScript)'"]
+        // Python script that reads raw PCM from stdin and transcribes
+        // No ffmpeg subprocess - direct numpy → mlx-whisper
+        let pythonScript = """
+import sys
+import numpy as np
+import mlx_whisper
 
-        // Set environment to include ffmpeg path (needed by mlx_whisper for audio loading)
-        var environment = ProcessInfo.processInfo.environment
-        let ffmpegPaths = "/opt/homebrew/bin:/usr/local/bin"
-        if let existingPath = environment["PATH"] {
-            environment["PATH"] = "\(ffmpegPaths):\(existingPath)"
-        } else {
-            environment["PATH"] = ffmpegPaths
-        }
-        process.environment = environment
+# Read raw PCM data from stdin (16-bit little-endian)
+raw_data = sys.stdin.buffer.read()
+# Convert to numpy float32 array normalized to [-1, 1]
+audio = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+# Transcribe directly (no ffmpeg!)
+result = mlx_whisper.transcribe(audio, path_or_hf_repo='\(model.mlxRepo)')
+print(result['text'])
+"""
 
+        process.executableURL = URL(fileURLWithPath: pythonPath)
+        process.arguments = ["-c", pythonScript]
+        process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
@@ -178,6 +163,10 @@ class TranscriptionService {
 
             do {
                 try process.run()
+
+                // Write raw PCM data to stdin, then close
+                inputPipe.fileHandleForWriting.write(audioData)
+                try? inputPipe.fileHandleForWriting.close()
             } catch {
                 timeoutTask.cancel()
                 safeResume(with: .failure(error))
@@ -225,34 +214,4 @@ class TranscriptionService {
         }
     }
 
-    /// Checks if ffmpeg is available in PATH.
-    /// mlx-whisper requires ffmpeg to load audio files.
-    private func checkFfmpegAvailable() async throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        process.arguments = ["ffmpeg"]
-
-        // Set same environment as transcription process (includes homebrew paths)
-        var environment = ProcessInfo.processInfo.environment
-        let ffmpegPaths = "/opt/homebrew/bin:/usr/local/bin"
-        if let existingPath = environment["PATH"] {
-            environment["PATH"] = "\(ffmpegPaths):\(existingPath)"
-        } else {
-            environment["PATH"] = ffmpegPaths
-        }
-        process.environment = environment
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-
-        try process.run()
-        process.waitUntilExit()
-
-        if process.terminationStatus != 0 {
-            throw TranscriptionError.transcriptionFailed(
-                "ffmpeg not found. Please install with: brew install ffmpeg"
-            )
-        }
-    }
 }
