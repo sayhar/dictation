@@ -81,10 +81,12 @@ class AudioRecorder {
     func stopRecording() -> Data? {
         guard isRecording else { return nil }
 
+        // Always clear flag, even if stop/removeTap throws
+        defer { isRecording = false }
+
         // Stop the engine and remove tap
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
-        isRecording = false
 
         // Get the recorded samples
         bufferLock.lock()

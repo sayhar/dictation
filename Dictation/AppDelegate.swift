@@ -180,14 +180,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         isRecording = false
 
-        // Check wall-clock duration FIRST - before anything else
+        // Get audio data first (stopRecording can only be called once!)
+        guard let audioData = audioRecorder.stopRecording() else {
+            NSLog("AppDelegate: No audio data captured")
+            resetIcon()
+            return
+        }
+
+        // Check duration AFTER getting audio
         let minDurationSeconds = 0.5
         if let startTime = recordingStartTime {
             let elapsed = Date().timeIntervalSince(startTime)
             NSLog("AppDelegate: Recording duration: %.2fs", elapsed)
             if elapsed < minDurationSeconds {
                 NSLog("AppDelegate: Recording too short (%.2fs < %.2fs), discarding", elapsed, minDurationSeconds)
-                _ = audioRecorder.stopRecording()  // Stop but discard
                 resetIcon()
                 return
             }
@@ -195,12 +201,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         DispatchQueue.main.async {
             self.statusItem.button?.title = "💭"
-        }
-
-        guard let audioData = audioRecorder.stopRecording() else {
-            NSLog("AppDelegate: No audio data captured")
-            resetIcon()
-            return
         }
 
         NSLog("AppDelegate: Recording stopped, transcribing \(audioData.count) bytes...")
@@ -213,9 +213,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     model: preferences.selectedModel
                 )
 
+                NSLog("AppDelegate: Transcription returned text length: \(text.count)")
+
                 await MainActor.run {
                     if !text.isEmpty {
+                        NSLog("AppDelegate: Calling textInjector.typeText with \(text.count) chars")
                         self.textInjector.typeText(text)
+                        NSLog("AppDelegate: textInjector.typeText completed")
+                    } else {
+                        NSLog("AppDelegate: Transcription returned empty text - not typing")
                     }
                 }
             } catch {

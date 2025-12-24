@@ -29,6 +29,16 @@ class TextInjector {
         // Small delay to ensure clipboard is ready
         usleep(50000)  // 50ms
 
+        // Verify clipboard contents to prevent race condition
+        // (Another app could have modified clipboard during the delay)
+        guard let verification = pasteboard.string(forType: .string),
+              verification == text else {
+            NSLog("TextInjector: Clipboard verification failed - was modified by another app")
+            // Restore original clipboard and bail
+            restorePasteboardContents(pasteboard, contents: savedContents)
+            return
+        }
+
         // Simulate Cmd+V
         simulatePaste()
 

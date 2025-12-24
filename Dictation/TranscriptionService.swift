@@ -23,6 +23,37 @@ class TranscriptionService {
     init() {
         logPath = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/Dictation_Transcripts.log")
+
+        // Pre-warm Python on startup (background thread)
+        Task.detached(priority: .utility) {
+            await self.prewarmPython()
+        }
+    }
+
+    /// Pre-warms Python interpreter by importing mlx_whisper.
+    /// This eliminates cold-start delay on first transcription.
+    private func prewarmPython() async {
+        guard let resourcePath = Bundle.main.resourcePath else { return }
+        let pythonPath = "\(resourcePath)/python/bin/python3"
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: pythonPath)
+        process.arguments = ["-c", "import mlx_whisper; print('ready')"]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            NSLog("TranscriptionService: Pre-warming Python (importing mlx_whisper)...")
+            let start = Date()
+            try process.run()
+            process.waitUntilExit()
+            let elapsed = Date().timeIntervalSince(start)
+            NSLog("TranscriptionService: Python pre-warm completed in %.1fs", elapsed)
+        } catch {
+            NSLog("TranscriptionService: Python pre-warm failed: \(error)")
+        }
     }
 
     // MARK: - Public Methods
@@ -35,8 +66,8 @@ class TranscriptionService {
     func transcribe(audioData: Data, model: WhisperModel) async throws -> String {
         // Calculate audio duration for timeout
         let audioDuration = calculateAudioDuration(from: audioData)
-        // Short recordings get 15s timeout, longer ones get 2x duration or 120s minimum
-        let timeout: TimeInterval = audioDuration < 5 ? 15 : max(baseTimeout, audioDuration * 2)
+        // Short recordings get 30s timeout (accounts for Python cold start), longer ones get 2x duration or 120s minimum
+        let timeout: TimeInterval = audioDuration < 5 ? 30 : max(baseTimeout, audioDuration * 2)
 
         NSLog("TranscriptionService: Transcribing %.1fs of audio with %@ model (timeout: %.0fs)", audioDuration, model.rawValue, timeout)
         NSLog("TranscriptionService: Audio data size: %d bytes", audioData.count)
@@ -136,10 +167,12 @@ print(result['text'])
 
             // Create timeout task - use SIGKILL to force kill
             let timeoutTask = DispatchWorkItem {
-                if process.isRunning {
-                    NSLog("TranscriptionService: TIMEOUT - killing process")
-                    kill(process.processIdentifier, SIGKILL)
-                }
+                // Capture PID before checking (prevents TOCTOU race)
+                let pid = process.processIdentifier
+                guard pid > 0 && process.isRunning else { return }
+
+                NSLog("TranscriptionService: TIMEOUT - killing PID \(pid)")
+                kill(pid, SIGKILL)
             }
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutTask)
 
@@ -168,6 +201,11 @@ print(result['text'])
                 inputPipe.fileHandleForWriting.write(audioData)
                 try? inputPipe.fileHandleForWriting.close()
             } catch {
+                // Clean up pipes to prevent file descriptor leak
+                try? inputPipe.fileHandleForWriting.close()
+                try? outputPipe.fileHandleForReading.closeFile()
+                try? errorPipe.fileHandleForReading.closeFile()
+
                 timeoutTask.cancel()
                 safeResume(with: .failure(error))
             }
