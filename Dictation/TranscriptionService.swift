@@ -90,6 +90,9 @@ class TranscriptionService {
         model: WhisperModel,
         timeout: TimeInterval
     ) async throws -> String {
+        // Verify ffmpeg is available (required by mlx-whisper for audio loading)
+        try await checkFfmpegAvailable()
+
         // Use Python whisper via command line
         // This leverages the existing Python environment and model cache
         let process = Process()
@@ -219,6 +222,37 @@ class TranscriptionService {
             }
         } else {
             try? entry.write(to: logPath, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Checks if ffmpeg is available in PATH.
+    /// mlx-whisper requires ffmpeg to load audio files.
+    private func checkFfmpegAvailable() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = ["ffmpeg"]
+
+        // Set same environment as transcription process (includes homebrew paths)
+        var environment = ProcessInfo.processInfo.environment
+        let ffmpegPaths = "/opt/homebrew/bin:/usr/local/bin"
+        if let existingPath = environment["PATH"] {
+            environment["PATH"] = "\(ffmpegPaths):\(existingPath)"
+        } else {
+            environment["PATH"] = ffmpegPaths
+        }
+        process.environment = environment
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        if process.terminationStatus != 0 {
+            throw TranscriptionError.transcriptionFailed(
+                "ffmpeg not found. Please install with: brew install ffmpeg"
+            )
         }
     }
 }
