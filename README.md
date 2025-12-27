@@ -20,15 +20,45 @@ A lightweight, local push-to-talk dictation app for macOS using OpenAI's Whisper
 ## Installation
 
 ### Prerequisites
-- macOS (tested on macOS 15+)
+- macOS 13.0+ (tested on macOS 15+)
+- [Homebrew](https://brew.sh)
+- **ffmpeg** (required for audio processing)
+
+### Swift Version (Recommended)
+
+The Swift version is faster, more native, and fully self-contained.
+
+1. **Install dependencies**:
+```bash
+brew install ffmpeg
+```
+
+2. **Clone and build**:
+```bash
+git clone https://github.com/sayhar/dictation-app.git
+cd dictation-app
+git checkout swift-rewrite
+./build-swift.sh
+```
+
+3. **Install the app**:
+```bash
+cp -R "dist/Swift Dictation.app" ~/Applications/
+open ~/Applications/"Swift Dictation.app"
+```
+
+### Python Version (Legacy)
+
+The original Python implementation.
+
+**Prerequisites:**
 - Python 3.12+
 - [uv](https://github.com/astral-sh/uv) package manager
+- ffmpeg
 
-### Quick Install
-
-1. **Install uv** (if not already installed):
+1. **Install dependencies**:
 ```bash
-brew install uv
+brew install uv ffmpeg
 ```
 
 2. **Clone and build**:
@@ -45,16 +75,18 @@ cp -R dist/Dictation.app ~/Applications/
 open ~/Applications/Dictation.app
 ```
 
-4. **Grant permissions** when prompted:
-   - **Accessibility** (required for keyboard monitoring)
-   - **Microphone** (required for audio recording)
+### Post-Installation
+
+**Grant permissions** when prompted:
+- **Accessibility** (required for keyboard monitoring)
+- **Microphone** (required for audio recording)
 
 If the app doesn't request permissions automatically:
 - Go to System Settings → Privacy & Security → Accessibility
-- Click the "+" button and add Dictation.app
+- Click the "+" button and add the app
 - Do the same for Microphone
 
-5. **First run**: The app will download the selected Whisper model (~500MB for "small") on first use. This happens in the background.
+**First run**: The app will download the selected Whisper model (~500MB for "small") on first use. This happens in the background and is cached to `~/.cache/huggingface/`.
 
 ## Usage
 
@@ -77,16 +109,25 @@ Models are automatically downloaded to `~/.cache/whisper/` on first use.
 
 ## Technical Details
 
+### Swift Version
 Built with:
-- **Whisper**: OpenAI's speech recognition model
+- **mlx-whisper**: Metal-accelerated Whisper (30-40% faster on Apple Silicon)
+- **AVFoundation**: Native audio recording
+- **CoreGraphics**: Event tap for keyboard monitoring
+- **AppKit**: Menu bar interface
+- **ffmpeg**: Audio format handling (required dependency)
+
+### Python Version
+Built with:
+- **openai-whisper**: OpenAI's speech recognition model
 - **PyObjC**: Native macOS APIs for keyboard monitoring
 - **rumps**: Menu bar app framework
 - **sounddevice**: Audio recording
 - **py2app**: macOS app bundling
 
-### Why PyObjC instead of pynput?
+### Why Native APIs?
 
-Standard Python keyboard libraries (like pynput) don't work properly in bundled macOS apps due to accessibility permission issues. This app uses native PyObjC `CGEventTap` APIs which macOS properly recognizes and trusts.
+Standard Python keyboard libraries (like pynput) don't work properly in bundled macOS apps due to accessibility permission issues. Both versions use native `CGEventTap` APIs which macOS properly recognizes and trusts.
 
 ## Files
 

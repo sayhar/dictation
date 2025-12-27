@@ -32,3 +32,7 @@ CLAUDE.md
 
 # Application preferences temp files
 preferences.json.tmp
+
+# Swift build artifacts
+.build/
+.swiftpm/
