@@ -30,8 +30,9 @@ Swift rewrite of a push-to-talk dictation app. Hold Right Command → record aud
                                           ┌─────────────────┐
                                           │  TextInjector   │
                                           │                 │
-                                          │ CGEvent paste   │
-                                          │ (Cmd+V)         │
+                                          │ Queue-based     │
+                                          │ Cmd+V paste     │
+                                          │ Async restore   │
                                           └─────────────────┘
 ```
 
@@ -103,6 +104,73 @@ Dictation/
 ├── Models.swift           # WhisperModel enum, errors
 ├── Info.plist            # App metadata
 └── Dictation.entitlements # Permissions
+```
+
+## Recent Fixes (2026-01-06)
+
+### TextInjector Clipboard Bug Fix
+
+**Problem:** Old clipboard content was sometimes pasted instead of transcription.
+
+**Root Causes Identified:**
+1. **UI Blocking** - `usleep(500000)` froze the app for 500ms every paste
+2. **No Mutual Exclusion** - Rapid dictation caused clipboard corruption via concurrent pastes
+3. **Timing Too Short** - 500ms wasn't enough for slow Electron apps (Slack, VS Code, Discord)
+4. **No User Detection** - Couldn't detect if user manually copied during paste window
+5. **Wrong changeCount Math** - Expected `+1` but clipboard operations add `+3`
+
+**Solution Implemented:**
+```swift
+// Old approach (BROKEN)
+func typeText(_ text: String) {
+    saveClipboard()
+    setClipboard(text)
+    usleep(50000)      // Block 50ms
+    simulatePaste()
+    usleep(500000)     // Block 500ms - FREEZES UI!
+    restoreClipboard() // Too early for slow apps
+}
+
+// New approach (FIXED)
+func typeText(_ text: String) {
+    pendingTexts.append(text)  // Queue it
+    processPasteQueue()         // Process serially
+}
+
+private func performPaste(_ text: String) {
+    saveClipboard()
+    setClipboard(text)
+    // NO usleep() - NSPasteboard is synchronous!
+    simulatePaste()
+
+    // Async restore after 750ms - doesn't block UI
+    DispatchQueue.main.asyncAfter(.now() + .microseconds(750000)) {
+        if clipboardModifiedByUser() {
+            // Skip restore - preserve user's clipboard
+            return
+        }
+        restoreClipboard()
+        processPasteQueue() // Process next queued item
+    }
+}
+```
+
+**Key Improvements:**
+- Queue-based processing prevents concurrent paste corruption
+- Async restoration eliminates UI freezing
+- 750ms delay handles slow Electron apps
+- changeCount monitoring detects user clipboard changes
+- Transient marker (`org.nspasteboard.TransientType`) for clipboard manager etiquette
+
+**Log Output Example:**
+```
+TextInjector: Queued text (11 chars, 1 items in queue)
+TextInjector: Starting paste operation (11 chars, 0 remaining in queue)
+TextInjector: Saved clipboard (1 types, changeCount: 42)
+TextInjector: Set clipboard with transient marker (changeCount: 42 → 45)
+TextInjector: Cmd+V sent, waiting 750ms before restoring clipboard
+TextInjector: Restoring clipboard (changeCount: 45 → 45)
+TextInjector: Clipboard fully restored (1 types)
 ```
 
 ## Questions for Review

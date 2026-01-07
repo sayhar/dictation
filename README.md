@@ -21,27 +21,19 @@ A lightweight, local push-to-talk dictation app for macOS using OpenAI's Whisper
 
 ### Prerequisites
 - macOS 13.0+ (tested on macOS 15+)
-- [Homebrew](https://brew.sh)
-- **ffmpeg** (required for audio processing)
 
-### Swift Version (Recommended)
+### Swift Version (Current)
 
-The Swift version is faster, more native, and fully self-contained.
+The Swift version is faster, more native, and fully self-contained. No ffmpeg required!
 
-1. **Install dependencies**:
-```bash
-brew install ffmpeg
-```
-
-2. **Clone and build**:
+1. **Clone and build**:
 ```bash
 git clone https://github.com/sayhar/dictation-app.git
 cd dictation-app
-git checkout swift-rewrite
 ./build-swift.sh
 ```
 
-3. **Install the app**:
+2. **Install the app**:
 ```bash
 cp -R "dist/Swift Dictation.app" ~/Applications/
 open ~/Applications/"Swift Dictation.app"
@@ -112,10 +104,10 @@ Models are automatically downloaded to `~/.cache/whisper/` on first use.
 ### Swift Version
 Built with:
 - **mlx-whisper**: Metal-accelerated Whisper (30-40% faster on Apple Silicon)
-- **AVFoundation**: Native audio recording
-- **CoreGraphics**: Event tap for keyboard monitoring
+- **AVFoundation**: Native audio recording (16kHz mono PCM)
+- **CoreGraphics**: Event tap for keyboard monitoring and text injection
 - **AppKit**: Menu bar interface
-- **ffmpeg**: Audio format handling (required dependency)
+- **Bundled Python**: Self-contained Python 3.13 environment (no system dependencies)
 
 ### Python Version
 Built with:

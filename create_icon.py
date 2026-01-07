@@ -1,73 +1,106 @@
 #!/usr/bin/env python3
-"""Create a microphone icon for the Dictation app"""
+"""Extract the 🎙️ emoji and use it as the app icon"""
 
-from PIL import Image, ImageDraw
 import os
+import subprocess
 
-# Create a 1024x1024 image (macOS will scale it)
-size = 1024
-img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
-draw = ImageDraw.Draw(img)
-
-# Colors - modern blue/purple gradient feel
-mic_color = (100, 120, 255)  # Nice blue
-background = (255, 255, 255, 0)  # Transparent
-
-# Microphone body (rounded rectangle)
-mic_width = 280
-mic_height = 400
-mic_x = (size - mic_width) // 2
-mic_y = 180
-
-# Draw microphone capsule
-draw.rounded_rectangle(
-    [mic_x, mic_y, mic_x + mic_width, mic_y + mic_height],
-    radius=140,
-    fill=mic_color,
-    outline=None
-)
-
-# Microphone stand (vertical line down)
-stand_width = 40
-stand_x = (size - stand_width) // 2
-stand_y = mic_y + mic_height
-stand_height = 120
-
-draw.rectangle(
-    [stand_x, stand_y, stand_x + stand_width, stand_y + stand_height],
-    fill=mic_color
-)
-
-# Base (horizontal line)
-base_width = 220
-base_height = 40
-base_x = (size - base_width) // 2
-base_y = stand_y + stand_height
-
-draw.rounded_rectangle(
-    [base_x, base_y, base_x + base_width, base_y + base_height],
-    radius=20,
-    fill=mic_color
-)
-
-# Save as PNG first
+# Create a simple approach: render the emoji using macOS built-in tools
 script_dir = os.path.dirname(os.path.abspath(__file__))
-png_path = os.path.join(script_dir, "icon.png")
-img.save(png_path, 'PNG')
-print(f"Created {png_path}")
-
-# Convert to ICNS using macOS sips
 iconset_dir = os.path.join(script_dir, "icon.iconset")
 os.makedirs(iconset_dir, exist_ok=True)
 
-# Generate all required sizes for iconset
-sizes = [16, 32, 64, 128, 256, 512, 1024]
-for s in sizes:
-    img_resized = img.resize((s, s), Image.Resampling.LANCZOS)
-    img_resized.save(os.path.join(iconset_dir, f"icon_{s}x{s}.png"))
-    if s <= 512:  # Also create @2x versions
-        img_resized_2x = img.resize((s*2, s*2), Image.Resampling.LANCZOS)
-        img_resized_2x.save(os.path.join(iconset_dir, f"icon_{s}x{s}@2x.png"))
+# Use macOS's built-in emoji rendering via Swift
+swift_code = '''
+import Cocoa
+import Foundation
 
-print("Created iconset")
-print(f"Run: iconutil -c icns {iconset_dir}")
+let emoji = "🎙️"
+let sizes = [16, 32, 64, 128, 256, 512, 1024]
+
+for size in sizes {
+    let image = NSImage(size: NSSize(width: size, height: size))
+    image.lockFocus()
+
+    // Draw white background (will be made transparent later)
+    NSColor.clear.setFill()
+    NSRect(x: 0, y: 0, width: CGFloat(size), height: CGFloat(size)).fill()
+
+    // Draw emoji centered
+    let attributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: CGFloat(size) * 0.8),
+    ]
+    let string = NSAttributedString(string: emoji, attributes: attributes)
+    let stringSize = string.size()
+    let x = (CGFloat(size) - stringSize.width) / 2
+    let y = (CGFloat(size) - stringSize.height) / 2
+    string.draw(at: NSPoint(x: x, y: y))
+
+    image.unlockFocus()
+
+    // Save as PNG
+    if let tiffData = image.tiffRepresentation,
+       let bitmapImage = NSBitmapImageRep(data: tiffData),
+       let pngData = bitmapImage.representation(using: .png, properties: [:]) {
+        let path = "icon.iconset/icon_\\(size)x\\(size).png"
+        try? pngData.write(to: URL(fileURLWithPath: path))
+
+        // Also create @2x versions for smaller sizes
+        if size <= 512 {
+            let size2x = size * 2
+            let image2x = NSImage(size: NSSize(width: size2x, height: size2x))
+            image2x.lockFocus()
+            NSColor.clear.setFill()
+            NSRect(x: 0, y: 0, width: CGFloat(size2x), height: CGFloat(size2x)).fill()
+            let attributes2x: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: CGFloat(size2x) * 0.8),
+            ]
+            let string2x = NSAttributedString(string: emoji, attributes: attributes2x)
+            let stringSize2x = string2x.size()
+            let x2x = (CGFloat(size2x) - stringSize2x.width) / 2
+            let y2x = (CGFloat(size2x) - stringSize2x.height) / 2
+            string2x.draw(at: NSPoint(x: x2x, y: y2x))
+            image2x.unlockFocus()
+
+            if let tiffData2x = image2x.tiffRepresentation,
+               let bitmapImage2x = NSBitmapImageRep(data: tiffData2x),
+               let pngData2x = bitmapImage2x.representation(using: .png, properties: [:]) {
+                let path2x = "icon.iconset/icon_\\(size)x\\(size)@2x.png"
+                try? pngData2x.write(to: URL(fileURLWithPath: path2x))
+            }
+        }
+    }
+}
+
+print("✓ Created emoji iconset")
+'''
+
+# Write Swift script to temp file
+swift_file = "/tmp/create_emoji_icon.swift"
+with open(swift_file, "w") as f:
+    f.write(swift_code)
+
+# Run Swift script
+print("Rendering 🎙️ emoji at multiple sizes...")
+result = subprocess.run(
+    ["swift", swift_file],
+    cwd=script_dir,
+    capture_output=True,
+    text=True
+)
+
+if result.returncode == 0:
+    print(result.stdout)
+
+    # Also create the 1024px version as icon.png for preview
+    subprocess.run([
+        "cp",
+        "icon.iconset/icon_1024x1024.png",
+        "icon.png"
+    ], cwd=script_dir)
+
+    print(f"\nNext steps:")
+    print(f"  iconutil -c icns icon.iconset")
+    print(f"  mv icon.icns Swift_Dictation.icns")
+    print(f"  ./build-swift.sh")
+else:
+    print(f"Error: {result.stderr}")

@@ -63,6 +63,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("AppDelegate: setting up keyboard monitor")
         setupKeyboardMonitor()
 
+        // Set up warmup status callback - show ⏳ during Python initialization
+        transcriptionService.onWarmupStatusChange = { [weak self] success in
+            guard let self = self else { return }
+            if success {
+                NSLog("AppDelegate: Python warmup complete, ready for dictation")
+                self.resetIcon()
+            } else {
+                NSLog("AppDelegate: Python warmup FAILED")
+                self.showError("Python initialization failed")
+            }
+        }
+
+        // Show ⏳ during initial warmup
+        statusItem.button?.title = "⏳"
+
         // Subscribe to wake notifications to re-enable event tap
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
@@ -71,7 +86,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        NSLog("AppDelegate: startup complete")
+        NSLog("AppDelegate: startup complete (Python warming up...)")
         print("Dictation app started successfully")
     }
 
@@ -222,10 +237,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         NSLog("AppDelegate: textInjector.typeText completed")
                     } else {
                         NSLog("AppDelegate: Transcription returned empty text - not typing")
+                        self.showError("Transcription returned empty")
                     }
                 }
             } catch {
                 NSLog("AppDelegate: Transcription FAILED: \(error)")
+                await MainActor.run {
+                    self.showError("Transcription failed: \(error.localizedDescription)")
+                }
             }
 
             await MainActor.run {

@@ -18,6 +18,14 @@ class TranscriptionService {
     /// Log file path for long transcriptions
     private let logPath: URL
 
+    /// Warmup completion tracking
+    private var isPythonWarmedUp = false
+    private var warmupCompletionHandlers: [(Bool) -> Void] = []
+    private let warmupLock = NSLock()
+
+    /// Callback for warmup status updates (called on main thread)
+    var onWarmupStatusChange: ((Bool) -> Void)?
+
     // MARK: - Initialization
 
     init() {
@@ -33,7 +41,10 @@ class TranscriptionService {
     /// Pre-warms Python interpreter by importing mlx_whisper.
     /// This eliminates cold-start delay on first transcription.
     private func prewarmPython() async {
-        guard let resourcePath = Bundle.main.resourcePath else { return }
+        guard let resourcePath = Bundle.main.resourcePath else {
+            notifyWarmupComplete(success: false)
+            return
+        }
         let pythonPath = "\(resourcePath)/python/bin/python3"
 
         let process = Process()
@@ -50,9 +61,67 @@ class TranscriptionService {
             try process.run()
             process.waitUntilExit()
             let elapsed = Date().timeIntervalSince(start)
-            NSLog("TranscriptionService: Python pre-warm completed in %.1fs", elapsed)
+
+            let success = process.terminationStatus == 0
+            NSLog("TranscriptionService: Python pre-warm \(success ? "completed" : "failed") in %.1fs", elapsed)
+            notifyWarmupComplete(success: success)
         } catch {
             NSLog("TranscriptionService: Python pre-warm failed: \(error)")
+            notifyWarmupComplete(success: false)
+        }
+    }
+
+    /// Notifies waiting tasks that warmup is complete
+    private func notifyWarmupComplete(success: Bool) {
+        warmupLock.lock()
+        isPythonWarmedUp = success
+        let handlers = warmupCompletionHandlers
+        warmupCompletionHandlers.removeAll()
+        warmupLock.unlock()
+
+        // Notify completion handlers
+        for handler in handlers {
+            handler(success)
+        }
+
+        // Notify status change callback on main thread
+        if let callback = onWarmupStatusChange {
+            DispatchQueue.main.async {
+                callback(success)
+            }
+        }
+    }
+
+    /// Waits for Python warmup to complete before proceeding
+    private func waitForWarmup() async throws {
+        warmupLock.lock()
+        let alreadyWarmed = isPythonWarmedUp
+        warmupLock.unlock()
+
+        if alreadyWarmed {
+            return // Already warmed up, proceed immediately
+        }
+
+        NSLog("TranscriptionService: Waiting for Python pre-warm to complete...")
+
+        // Wait for warmup completion
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            warmupLock.lock()
+            if isPythonWarmedUp {
+                // Completed while we were acquiring lock
+                warmupLock.unlock()
+                continuation.resume()
+            } else {
+                // Still warming up, add handler
+                warmupCompletionHandlers.append { success in
+                    if success {
+                        continuation.resume()
+                    } else {
+                        continuation.resume(throwing: TranscriptionError.modelNotLoaded)
+                    }
+                }
+                warmupLock.unlock()
+            }
         }
     }
 
@@ -64,6 +133,10 @@ class TranscriptionService {
     ///   - model: Whisper model to use
     /// - Returns: Transcribed text
     func transcribe(audioData: Data, model: WhisperModel) async throws -> String {
+        // Wait for Python warmup to complete before transcribing
+        // This prevents resource contention on first transcription
+        try await waitForWarmup()
+
         // Calculate audio duration for timeout
         let audioDuration = calculateAudioDuration(from: audioData)
         // Short recordings get 30s timeout (accounts for Python cold start), longer ones get 2x duration or 120s minimum

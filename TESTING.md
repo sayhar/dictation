@@ -63,6 +63,27 @@ tail -f ~/Library/Logs/Dictation.log
 
 ---
 
+### 7. ❌ Old Clipboard Content Pasted
+**Bug:** Sometimes old clipboard content gets pasted instead of transcription
+
+**Test:**
+1. Copy "ORIGINAL TEXT" to clipboard
+2. Hold Right Command, say "hello world", release
+3. Text should appear: "hello world"
+4. Press Cmd+V again
+5. ✅ PASS: "ORIGINAL TEXT" is pasted (clipboard was properly restored)
+6. ❌ FAIL: "hello world" or some other old content is pasted
+
+**Root Causes Fixed (2026-01-06):**
+- Clipboard restored too early (500ms → 750ms async)
+- No mutual exclusion for rapid dictation (added queue system)
+- Main thread blocking caused UI freezes (removed usleep)
+- Didn't detect user clipboard changes (added changeCount monitoring)
+
+**Status:** ✅ FIXED (2026-01-06 - TextInjector rewrite with queue-based paste operations)
+
+---
+
 ### 5. ❌ Stream Stop Deadlock
 **Bug:** Using `stream.stop()` blocks waiting for buffers, preventing new recordings
 
